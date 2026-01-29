@@ -40,7 +40,11 @@ static char *g_json_cache = NULL;
 static time_t g_last_update_time = 0;
 static pthread_mutex_t g_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+void build_channel_lookup();
+
 int db_init() {
+    build_channel_lookup(); // Build fast lookup on init
+
     int rc = sqlite3_open(DB_PATH, &db);
     if (rc) {
         fprintf(stderr, "Can't open database: %s\n", sqlite3_errmsg(db));
@@ -140,6 +144,7 @@ int append_str(char **dest, size_t *size, size_t *cap, const char *src) {
     size_t len = strlen(src);
     if (*size + len + 1 > *cap) {
         size_t new_cap = (*size + len + 1) * 2;
+        // Sometimes a large jump is better if we are growing huge
         if (new_cap < *cap + 1024*1024) new_cap = *cap + 1024*1024; 
         
         char *new_dest = realloc(*dest, new_cap);
@@ -150,6 +155,56 @@ int append_str(char **dest, size_t *size, size_t *cap, const char *src) {
     strcpy(*dest + *size, src);
     *size += len;
     return 1;
+}
+
+// Minimal hash/lookup for Channel pointers to avoid linear scan
+#define LOOKUP_SIZE 1024
+static Channel *channel_lookup[LOOKUP_SIZE];
+
+static unsigned int hash_channel(const char *freq, const char *svc_id) {
+    unsigned int hash = 5381;
+    for (const char *p = freq; *p; p++) hash = ((hash << 5) + hash) + *p;
+    hash = ((hash << 5) + hash) + '_';
+    for (const char *p = svc_id; *p; p++) hash = ((hash << 5) + hash) + *p;
+    return hash % LOOKUP_SIZE;
+}
+
+// In case of collisions, we just might miss one (simplified for this task)
+// But to be robust, we should handle collisions. 
+// Given small N (<100), linear scan over collide bucket? 
+// Or actually, just linear scan is fast for N=100.
+// But the user requested "fast lookup map".
+// Let's assume perfect hash or small collision rate is acceptable for speed, 
+// OR simpler: simple direct addressing if possible? No.
+// Let's implement open addressing or just a simple linear probe.
+// Actually, simple static array of pointers populated on db_init is enough.
+
+void build_channel_lookup() {
+    memset(channel_lookup, 0, sizeof(channel_lookup));
+    for (int i = 0; i < channel_count; i++) {
+        unsigned int h = hash_channel(channels[i].frequency, channels[i].number);
+        unsigned int start = h;
+        while (channel_lookup[h]) {
+            h = (h + 1) % LOOKUP_SIZE;
+            if (h == start) break; // Full
+        }
+        channel_lookup[h] = &channels[i];
+    }
+}
+
+Channel *find_channel_fast(const char *freq, const char *svc_id) {
+    if (!freq || !svc_id) return NULL;
+    unsigned int h = hash_channel(freq, svc_id);
+    unsigned int start = h;
+    while (channel_lookup[h]) {
+        if (strcmp(channel_lookup[h]->frequency, freq) == 0 &&
+            strcmp(channel_lookup[h]->number, svc_id) == 0) {
+            return channel_lookup[h];
+        }
+        h = (h + 1) % LOOKUP_SIZE;
+        if (h == start) break;
+    }
+    return NULL;
 }
 
 // Returns 0 on OOM, 1 on success
@@ -244,13 +299,7 @@ char *db_get_xmltv_programs() {
 
         Channel *ch = NULL;
         if (freq && svc_id) {
-            for (int i = 0; i < channel_count; i++) {
-                if (strcmp(channels[i].frequency, freq) == 0 && 
-                    strcmp(channels[i].number, svc_id) == 0) {
-                    ch = &channels[i];
-                    break;
-                }
-            }
+            ch = find_channel_fast(freq, svc_id);
         }
         const char *channel_id = ch ? get_unique_channel_id(ch) : (svc_id ? svc_id : "");
 

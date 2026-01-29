@@ -26,12 +26,22 @@ static int server_fd = -1;
 static int shutdown_pipe[2] = {-1, -1};
 static volatile sig_atomic_t http_running = 1;
 static thread_pool_t *pool = NULL;
+#define MAX_STREAMS 20
+static volatile int active_streams = 0;
 
 typedef struct {
     int fd;
     char buffer[MAX_HEADER_SIZE];
     size_t total_read;
 } client_context_t;
+
+void process_client_request(void *arg);
+
+void *stream_worker_entry(void *arg) {
+    process_client_request(arg);
+    __atomic_sub_fetch(&active_streams, 1, __ATOMIC_SEQ_CST);
+    return NULL;
+}
 
 static void set_nonblocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
@@ -415,17 +425,50 @@ void start_http_server(int port) {
                     ctx->total_read += n;
                     ctx->buffer[ctx->total_read] = '\0';
 
-                    if (strstr(ctx->buffer, "\r\n\r\n")) {
-                        // Full header receive
-                        epoll_ctl(epoll_fd, EPOLL_CTL_DEL, ctx->fd, NULL);
-                        if (thread_pool_submit(pool, process_client_request, ctx) < 0) {
-                            LOG_WARN("HTTP", "Thread pool full, dropping request");
-                            send_response(ctx->fd, "503 Service Unavailable", "text/plain", "Server busy");
-                            close(ctx->fd);
-                            free(ctx);
+                if (strstr(ctx->buffer, "\r\n\r\n")) {
+                    // Full header receive
+                    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, ctx->fd, NULL);
+                    
+                    // Pre-parse to determine dispatch target
+                    char method[16], path[1024];
+                    if (sscanf(ctx->buffer, "%15s %1023s", method, path) == 2) {
+                        if (strncmp(path, "/stream/", 8) == 0) {
+                            // Direct streaming request -> Detached thread
+                            if (__atomic_fetch_add(&active_streams, 1, __ATOMIC_SEQ_CST) >= MAX_STREAMS) {
+                                __atomic_sub_fetch(&active_streams, 1, __ATOMIC_SEQ_CST);
+                                LOG_WARN("HTTP", "Max concurrent streams reached, dropping request");
+                                send_response(ctx->fd, "503 Service Unavailable", "text/plain", "Too many streams");
+                                close(ctx->fd);
+                                free(ctx);
+                            } else {
+                                pthread_t tid;
+                                if (pthread_create(&tid, NULL, stream_worker_entry, ctx) != 0) {
+                                    __atomic_sub_fetch(&active_streams, 1, __ATOMIC_SEQ_CST);
+                                    LOG_ERROR("HTTP", "Failed to spawn stream thread");
+                                    close(ctx->fd);
+                                    free(ctx);
+                                } else {
+                                    pthread_detach(tid);
+                                }
+                            }
+                        } else {
+                            // API Request -> Thread Pool
+                            if (thread_pool_submit(pool, process_client_request, ctx) < 0) {
+                                LOG_WARN("HTTP", "Thread pool full, dropping request");
+                                send_response(ctx->fd, "503 Service Unavailable", "text/plain", "Server busy");
+                                close(ctx->fd);
+                                free(ctx);
+                            }
                         }
-                        break; // Request dispatched
-                    } 
+                    } else {
+                         // Malformed, let the worker handle/reject it (or reject here, but worker is safer for full parsing)
+                         if (thread_pool_submit(pool, process_client_request, ctx) < 0) {
+                             close(ctx->fd);
+                             free(ctx);
+                         }
+                    }
+                    break; // Request dispatched
+                } 
                     
                     if (ctx->total_read >= sizeof(ctx->buffer) - 1) {
                         send_response(ctx->fd, "431 Request Header Fields Too Large", "text/plain", "Too large");
