@@ -69,12 +69,27 @@ Channel *find_channel_by_freq_sid(const char *freq, int service_id);
 int is_vcn_duplicated(const char *number);
 
 /**
- * Get a unique channel ID for XMLTV output
- * Returns simple format ("16.1") normally, or with MHz suffix ("16.1-527")
- * if the same VCN exists on multiple frequencies
- * @param ch Pointer to Channel
- * @return Static string with unique channel ID
+ * Build the fast lookup map for channels
+ * Should be called once after loading channels
  */
-const char *get_unique_channel_id(Channel *ch);
+void build_channel_lookup();
+
+/**
+ * Fast lookup by frequency and service ID (O(1))
+ * @param freq Frequency string
+ * @param svc_id Service ID string (or number string)
+ * @return Pointer to Channel or NULL
+ */
+Channel *find_channel_fast(const char *freq, const char *svc_id);
+
+/**
+ * Get a unique channel ID for XMLTV output (Thread-safe)
+ * Writes to provided buffer.
+ * @param ch Pointer to Channel
+ * @param buf Output buffer
+ * @param len Size of output buffer
+ * @return Pointer to buf (or empty string on error)
+ */
+const char *get_unique_channel_id(Channel *ch, char *buf, size_t len);
 
 #endif

@@ -192,23 +192,60 @@ int is_vcn_duplicated(const char *number) {
     return 0;
 }
 
-// Get unique channel ID for a channel
-// Returns "16.1" normally, or "16.1-527" if duplicates exist (uses first 3 digits of freq)
-const char *get_unique_channel_id(Channel *ch) {
-    static char id_buf[64];
-    
-    if (!ch) return "";
+// Fast Lookup Implementation
+
+#define LOOKUP_SIZE 1024
+static Channel *channel_lookup[LOOKUP_SIZE];
+
+static unsigned int hash_channel(const char *freq, const char *svc_id) {
+    unsigned int hash = 5381;
+    for (const char *p = freq; *p; p++) hash = ((hash << 5) + hash) + *p;
+    hash = ((hash << 5) + hash) + '_';
+    for (const char *p = svc_id; *p; p++) hash = ((hash << 5) + hash) + *p;
+    return hash % LOOKUP_SIZE;
+}
+
+void build_channel_lookup() {
+    memset(channel_lookup, 0, sizeof(channel_lookup));
+    for (int i = 0; i < channel_count; i++) {
+        unsigned int h = hash_channel(channels[i].frequency, channels[i].number);
+        unsigned int start = h;
+        while (channel_lookup[h]) {
+            h = (h + 1) % LOOKUP_SIZE;
+            if (h == start) break; // Full
+        }
+        channel_lookup[h] = &channels[i];
+    }
+}
+
+Channel *find_channel_fast(const char *freq, const char *svc_id) {
+    if (!freq || !svc_id) return NULL;
+    unsigned int h = hash_channel(freq, svc_id);
+    unsigned int start = h;
+    while (channel_lookup[h]) {
+        if (strcmp(channel_lookup[h]->frequency, freq) == 0 &&
+            strcmp(channel_lookup[h]->number, svc_id) == 0) {
+            return channel_lookup[h];
+        }
+        h = (h + 1) % LOOKUP_SIZE;
+        if (h == start) break;
+    }
+    return NULL;
+}
+
+// Get unique channel ID for a channel (Thread-safe)
+const char *get_unique_channel_id(Channel *ch, char *buf, size_t len) {
+    if (!ch || !buf || len == 0) return "";
     
     if (is_vcn_duplicated(ch->number)) {
         // Extract first 3 significant digits from frequency for disambiguation
-        // e.g., 527000000 -> 527, 581000000 -> 581
         long freq = atol(ch->frequency);
         int prefix = (int)(freq / 1000000); // MHz value
-        snprintf(id_buf, sizeof(id_buf), "%s-%d", ch->number, prefix);
+        snprintf(buf, len, "%s-%d", ch->number, prefix);
     } else {
-        snprintf(id_buf, sizeof(id_buf), "%s", ch->number);
+        snprintf(buf, len, "%s", ch->number);
     }
     
-    return id_buf;
+    return buf;
 }
 

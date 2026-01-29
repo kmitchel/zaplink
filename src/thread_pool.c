@@ -20,6 +20,8 @@ struct thread_pool {
     int num_threads;
     int shutdown;
     int working_count;
+    int queue_count;
+    int max_queue_size;
 };
 
 static void *thread_worker(void *arg) {
@@ -37,12 +39,14 @@ static void *thread_worker(void *arg) {
             break;
         }
 
+
         job_t *job = pool->job_head;
         if (job) {
             pool->job_head = job->next;
             if (pool->job_head == NULL) {
                 pool->job_tail = NULL;
             }
+            pool->queue_count--;
         }
 
         pool->working_count++;
@@ -70,6 +74,8 @@ thread_pool_t *thread_pool_create(int num_threads) {
     pool->num_threads = num_threads;
     pool->shutdown = 0;
     pool->working_count = 0;
+    pool->queue_count = 0;
+    pool->max_queue_size = 256; // Hard check to prevent accumulated bloat
     pool->job_head = NULL;
     pool->job_tail = NULL;
 
@@ -104,20 +110,27 @@ thread_pool_t *thread_pool_create(int num_threads) {
 int thread_pool_submit(thread_pool_t *pool, thread_func_t func, void *arg) {
     if (!pool || !func) return -1;
 
-    job_t *job = (job_t *)malloc(sizeof(job_t));
-    if (!job) return -1;
-
-    job->func = func;
-    job->arg = arg;
-    job->next = NULL;
-
     pthread_mutex_lock(&pool->lock);
 
     if (pool->shutdown) {
         pthread_mutex_unlock(&pool->lock);
-        free(job);
         return -1;
     }
+
+    if (pool->queue_count >= pool->max_queue_size) {
+        pthread_mutex_unlock(&pool->lock);
+        return -1; // Queue full
+    }
+
+    job_t *job = (job_t *)malloc(sizeof(job_t));
+    if (!job) {
+        pthread_mutex_unlock(&pool->lock);
+        return -1;
+    }
+
+    job->func = func;
+    job->arg = arg;
+    job->next = NULL;
 
     if (pool->job_tail) {
         pool->job_tail->next = job;
@@ -126,6 +139,17 @@ int thread_pool_submit(thread_pool_t *pool, thread_func_t func, void *arg) {
         pool->job_head = job;
         pool->job_tail = job;
     }
+    
+    // Increment count (tracking active jobs + queue)
+    pool->working_count++; 
+    // In this simple implementation:
+    // working_count tracks TOTAL (queued + running).
+    // The previous implementation used working_count only for running threads?
+    // Let's check thread_worker. 
+    // Wait, the previous code increments working_count inside thread_worker when picking up a job.
+    // So that tracks running.
+    // We need a separate queue_count.
+    pool->queue_count++;
 
     pthread_cond_signal(&pool->notify);
     pthread_mutex_unlock(&pool->lock);
