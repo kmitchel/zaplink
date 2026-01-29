@@ -38,8 +38,9 @@ typedef struct {
 /**
  * Handle a unified stream request (Transcoded or Raw)
  * Spawns dvbv5-zap (and FFmpeg for transcoding) and pipes output to sockfd.
+ * http_header is sent only after the first data chunk arrives.
  */
-void handle_unified_stream(int sockfd, StreamConfig *config);
+void handle_unified_stream(int sockfd, StreamConfig *config, const char *http_header);
 
 /**
  * Parse backend and codec strings

@@ -243,9 +243,8 @@ void *client_thread(void *arg) {
         char head[256];
         const char *mime = is_software_av1 ? "video/x-matroska" : "video/mp2t";
         snprintf(head, sizeof(head), "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nConnection: keep-alive\r\nAccess-Control-Allow-Origin: *\r\n\r\n", mime);
-        // Send HTTP header immediately to prevent client timeout while tuner locks
-        write_all(sockfd, head, strlen(head));
-        handle_unified_stream(sockfd, &config);
+        // Pass header to stream handler - sent after first data chunk arrives
+        handle_unified_stream(sockfd, &config, head);
     } else {
         send_response(sockfd, "404 Not Found", "text/plain", "ZapLink Engine: Valid endpoints: /stream/{ch}, /playlist.m3u, /xmltv.xml");
     }
