@@ -71,13 +71,18 @@ static int write_all(int fd, const char *buf, size_t len) {
 
 // Helper to append args to argv with safety check
 // Helper to append args to argv with overflow tracking
-static void add_arg(char **argv, int *argc, const char *arg) {
+static int add_arg(char **argv, int *argc, const char *arg) {
     if (*argc < 127) {
         argv[*argc] = (char *)arg;
         argv[*argc + 1] = NULL;
+        (*argc)++;
+        return 0;
     }
-    // Always increment counter to detect overflow
-    (*argc)++;
+    
+    // Overflow detected
+    LOG_ERROR("TRANSCODE", "Argv limit exceeded (128), dropping argument: %s", arg);
+    (*argc)++; // Increment to track total needed size
+    return -1;
 }
 
 void handle_unified_stream(int sockfd, StreamConfig *config, const char *http_header) {
@@ -336,8 +341,9 @@ void handle_unified_stream(int sockfd, StreamConfig *config, const char *http_he
             args[n] = NULL;
             
             // Check for argument overflow (n tracked total attempts)
-            if (n >= 127) {
-                LOG_ERROR("TRANSCODE", "Argument overflow detected (%d >= 127), aborting stream", n);
+            // Capacity is 127 args + NULL. If n > 127, we dropped something.
+            if (n > 127) {
+                LOG_ERROR("TRANSCODE", "Argument overflow detected (%d > 127), aborting stream", n);
                 _exit(1);
             }
             

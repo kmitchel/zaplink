@@ -2,6 +2,14 @@
 
 ZapLink is a lightweight ATSC/DVB backend that scans channels, builds an EPG from PSIP tables, and serves live streams and guide data over HTTP for clients like Jellyfin.
 
+## Security Features
+
+ZapLink has been hardened for production environments:
+
+-   **Shell Removal**: The transcoding pipeline uses direct `fork`/`execvp` calls, eliminating shell injection vulnerabilities associated with `system()` or `popen()`.
+-   **Argument Safety**: STRICT enforcement of argument limits (128) prevents buffer overflow attacks. The system aborts execution if command line arguments exceed safe limits.
+-   **HTTP Robustness**: Hardened request parser enforces 4KB header limits and proper termination checks to prevent DoS from slow or malformed clients.
+
 ## Features
 - **Automatic Channel Scan**: Parallel tuner scanning with RabbitEars zip-code hints and optional VHF skipping.
 - **Robust EPG**: Background EPG collection with valid XMLTV output supporting Jellyfin Series Recording.
