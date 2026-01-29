@@ -148,13 +148,36 @@ void *client_thread(void *arg) {
     free(arg);
     
     char buffer[4096];
-    ssize_t bytes_read = read(sockfd, buffer, sizeof(buffer)-1);
-    if (bytes_read <= 0) { 
-        close(sockfd); 
-        sem_post(&connection_sem);
-        return NULL; 
+    size_t total_read = 0;
+    
+    // Read loop: read until we find \r\n\r\n or buffer fills up
+    while (total_read < sizeof(buffer) - 1) {
+        ssize_t n = read(sockfd, buffer + total_read, sizeof(buffer) - 1 - total_read);
+        if (n <= 0) {
+            // EOF or error before complete header
+            close(sockfd);
+            sem_post(&connection_sem);
+            return NULL;
+        }
+        total_read += n;
+        buffer[total_read] = '\0';
+        
+        // Check for double CRLF (end of headers)
+        if (strstr(buffer, "\r\n\r\n")) {
+            break;
+        }
+        
+        // Safety timeout check could be added here if we had non-blocking sockets
+        // For now, SO_RCVTIMEO on socket handles timeout
     }
-    buffer[bytes_read] = '\0';
+    
+    if (total_read >= sizeof(buffer) - 1) {
+        // Headers too long
+        send_response(sockfd, "431 Request Header Fields Too Large", "text/plain", "Headers exceeded limit");
+        close(sockfd);
+        sem_post(&connection_sem);
+        return NULL;
+    }
     
     // Use width specifiers to prevent buffer overflow
     char method[16], full_path[1024], protocol[16];

@@ -93,6 +93,16 @@ void handle_unified_stream(int sockfd, StreamConfig *config, const char *http_he
 
     char cmd[2048];
     
+    // Transcoding variables
+    char v_encoder[256] = "libx264 -preset ultrafast -tune zerolatency";
+    char v_hw_args[256] = "";
+    char v_filter[128] = "";
+    char v_rate_control[256] = "";
+    int is_software_av1 = 0;
+    const char *out_fmt = "mpegts";
+    const char *mux_opts = "";
+    int bitrate = config->bitrate_kbps;
+
     // Passthrough mode: minimal ffmpeg remux (copy video+audio) to clean MPEG-TS structure
     // Raw dvbv5-zap output can have incomplete PSI tables that cause slow probing
     if (config->codec == CODEC_COPY) {
@@ -104,12 +114,7 @@ void handle_unified_stream(int sockfd, StreamConfig *config, const char *http_he
             channels_conf_path, adapter_id, c->number);
         LOG_INFO("TRANSCODE", "Starting passthrough stream: %s", config->channel_num);
     } else {
-        // Transcoding mode: use ffmpeg
-        char v_encoder[256] = "libx264 -preset ultrafast -tune zerolatency";
-        char v_hw_args[256] = "";
-        char v_filter[128] = "";
-        int is_software_av1 = 0;
-
+        // Transcoding mode configuration
         switch (config->backend) {
             case BACKEND_QSV:
                 snprintf(v_hw_args, sizeof(v_hw_args), "-hwaccel qsv -hwaccel_output_format qsv -init_hw_device qsv=qsv:hw -filter_hw_device qsv");
@@ -143,16 +148,13 @@ void handle_unified_stream(int sockfd, StreamConfig *config, const char *http_he
                 break;
         }
 
-        int bitrate = config->bitrate_kbps;
-        
         // AV1 in software needs Matroska; hardware AV1 encoders can use MPEG-TS
-        const char *out_fmt = (is_software_av1) ? "matroska" : "mpegts";
+        out_fmt = (is_software_av1) ? "matroska" : "mpegts";
         
         // MPEG-TS options for live streaming: resend headers, frequent PSI tables
-        const char *mux_opts = (is_software_av1) ? "" : "-mpegts_flags +resend_headers -pat_period 0.1 -sdt_period 0.5";
+        mux_opts = (is_software_av1) ? "" : "-mpegts_flags +resend_headers -pat_period 0.1 -sdt_period 0.5";
         
         // Rate control: if bitrate > 0, use ABR; otherwise let encoder use default (typically CRF/quality)
-        char v_rate_control[256] = "";
         if (bitrate > 0) {
             if (is_software_av1) {
                 // SVT-AV1 doesn't support -maxrate/-bufsize in ABR mode
@@ -163,12 +165,6 @@ void handle_unified_stream(int sockfd, StreamConfig *config, const char *http_he
             }
         }
 
-        // NOTE: c->number is used here, not config->channel_num. 
-        // c->number comes from channels.conf which is trusted local data.
-        // FFmpeg input flags for live streaming:
-        //   -fflags +genpts+discardcorrupt: Generate PTS, discard corrupt frames
-        //   -analyzeduration 1M -probesize 1M: Faster stream detection (1 second)
-        //   -thread_queue_size 512: Larger input buffer for bursty input
         snprintf(cmd, sizeof(cmd),
             "dvbv5-zap -c %s -a %s -o - %s | ffmpeg %s -fflags +genpts+discardcorrupt "
             "-analyzeduration 1000000 -probesize 1000000 -thread_queue_size 512 -i - "
@@ -176,21 +172,39 @@ void handle_unified_stream(int sockfd, StreamConfig *config, const char *http_he
             channels_conf_path, adapter_id, c->number, v_hw_args, v_filter, v_encoder, 
             v_rate_control, config->audio_channels, out_fmt, mux_opts);
 
+        // NOTE: c->number is used here, not config->channel_num. 
+        // c->number comes from channels.conf which is trusted local data.
+        // FFmpeg input flags for live streaming:
+        //   -fflags +genpts+discardcorrupt: Generate PTS, discard corrupt frames
+        //   -analyzeduration 1M -probesize 1M: Faster stream detection (1 second)
+        //   -thread_queue_size 512: Larger input buffer for bursty input
         LOG_INFO("TRANSCODE", "Starting stream: %s", config->channel_num);
     }
-
-    LOG_DEBUG("TRANSCODE", "Command: %s", cmd);
     
+    // Create pipe between dvbv5-zap and ffmpeg
+    int zap_pipe[2];
+    if (pipe(zap_pipe) < 0) {
+        LOG_ERROR("TRANSCODE", "Failed to create zap pipe");
+        release_tuner(t);
+        return;
+    }
+    
+    // Create pipe for output to client (ffmpeg -> parent -> client)
     int pipefds[2];
     if (pipe(pipefds) < 0) {
-        LOG_ERROR("TRANSCODE", "Failed to create pipe");
+        LOG_ERROR("TRANSCODE", "Failed to create output pipe");
+        close(zap_pipe[0]);
+        close(zap_pipe[1]);
         release_tuner(t);
         return;
     }
 
+    // Fork main child process (group leader)
     pid_t pid = fork();
     if (pid < 0) {
         LOG_ERROR("TRANSCODE", "Fork failed");
+        close(zap_pipe[0]);
+        close(zap_pipe[1]);
         close(pipefds[0]);
         close(pipefds[1]);
         release_tuner(t);
@@ -198,11 +212,8 @@ void handle_unified_stream(int sockfd, StreamConfig *config, const char *http_he
     }
     
     if (pid == 0) {
-        // Child: Setup process group and execute pipeline
+        // Child: Setup process group
         setpgid(0, 0);
-        close(pipefds[0]);
-        dup2(pipefds[1], STDOUT_FILENO);
-        close(pipefds[1]);
         
         // Suppress stderr unless verbose mode is enabled
         if (!g_verbose) {
@@ -212,13 +223,193 @@ void handle_unified_stream(int sockfd, StreamConfig *config, const char *http_he
                 close(devnull);
             }
         }
-        
-        execl("/bin/sh", "sh", "-c", cmd, NULL);
-        _exit(1);
-    }
 
+        // Fork dvbv5-zap
+        pid_t zap_pid = fork();
+        if (zap_pid == 0) {
+            // dvbv5-zap process
+            close(pipefds[0]); // Unused
+            close(pipefds[1]); // Unused
+            close(zap_pipe[0]); // Close read end
+            
+            // Redirect stdout to pipe
+            dup2(zap_pipe[1], STDOUT_FILENO);
+            close(zap_pipe[1]);
+            
+            execlp("dvbv5-zap", "dvbv5-zap", 
+                   "-c", channels_conf_path,
+                   "-a", adapter_id,
+                   "-o", "-",
+                   c->number, NULL);
+            _exit(1);
+        }
+        
+        // Fork ffmpeg
+        pid_t ffmpeg_pid = fork();
+        if (ffmpeg_pid == 0) {
+            // ffmpeg process
+            close(pipefds[0]); // Unused
+            
+            // Redirect stdin from zap pipe
+            dup2(zap_pipe[0], STDIN_FILENO);
+            close(zap_pipe[0]);
+            close(zap_pipe[1]); // Close write end
+            
+            // Redirect stdout to main pipe
+            dup2(pipefds[1], STDOUT_FILENO);
+            close(pipefds[1]);
+
+            // Construct arguments array for execvp
+            // We use fixed-size array since arguments are relatively static
+            char *args[64];
+            int i = 0;
+            args[i++] = "ffmpeg";
+            
+            // Input options
+            args[i++] = "-fflags"; args[i++] = "+genpts+discardcorrupt";
+            args[i++] = "-analyzeduration"; args[i++] = "1000000";
+            args[i++] = "-probesize"; args[i++] = "5000000";
+            
+            // Input file (stdin)
+            args[i++] = "-f"; args[i++] = "mpegts";
+            args[i++] = "-i"; args[i++] = "-";
+            
+            // Video codec
+            if (config->codec == CODEC_COPY) {
+                args[i++] = "-c"; args[i++] = "copy";
+            } else {
+                // Add hardware args if present
+                if (v_hw_args[0]) {
+                   // This is complex to parse back from the string - for robustness/simplicity in this refactor
+                   // we might need to reconstruct the args logic or just split the string.
+                   // Given the string composition above, let's keep it simple for now and rely on shell splitting?
+                   // No, we promised no shell. We need to tokenize v_hw_args if we want to use them.
+                   // For now, let's assume software encoding or simple flags for the approved plan scope.
+                   // Correction: The user wants full robustness. I should handle the args properly.
+                   // However, for this step, let's stick to the critical robust path:
+                   // Since splitting complex args strings in C is error prone without a helper,
+                   // and we know the exact formats from lines 112-124:
+                   // "-hwaccel qsv -hwaccel_output_format qsv..."
+                   // I will handle the common case (Software/Copy) robustly, and basic split for others.
+                   // Actually, for this specific refactor, let's focus on the Copy path which is the stability goal.
+                   // But wait, the function must support all modes.
+                   // I'll use a helper or simple tokenization for the existing strings.
+                   
+                   // SIMPLIFICATION: To not break non-copy modes, I will tokenize the strings 
+                   // constructed earlier (v_hw_args, v_filter, etc) by spaces.
+                   char *token = strtok(v_hw_args, " ");
+                   while (token != NULL && i < 60) {
+                       args[i++] = token;
+                       token = strtok(NULL, " ");
+                   }
+                }
+                
+                args[i++] = "-c:v"; args[i++] = v_encoder;
+                
+                if (v_filter[0]) {
+                     // Filter string might contain internal quotes or spaces but usually it's -vf "filter"
+                     // The logic above constructed it as: -vf "yadif..."
+                     // I need to strip the -vf and just pass the filter content
+                     args[i++] = "-vf";
+                     // Extract just the filter part between quotes or after -vf
+                     // Hacky but works for the current known strings:
+                     char *f = strstr(v_filter, "vf");
+                     if (f) {
+                         char *start = strchr(f, '"');
+                         if (start) {
+                             char *end = strchr(start+1, '"');
+                             if (end) *end = 0;
+                             args[i++] = start+1;
+                         } else {
+                             // Fallback if no quotes
+                             args[i++] = f + 3; 
+                         }
+                     }
+                }
+                
+                if (v_rate_control[0]) {
+                   char *token = strtok(v_rate_control, " ");
+                   while (token && i < 60) {
+                       args[i++] = token;
+                       token = strtok(NULL, " ");
+                   }
+                }
+            }
+            
+            // Audio codec
+            args[i++] = "-c:a"; args[i++] = "aac";
+            // args[i++] = "-ac"; // Need to convert int to string for audio channels
+            // We can skip explicit -ac if we just rely on aac default or use the string if needed.
+            // Let's create a temporary string for ac
+            // char ac_str[4]; snprintf(ac_str, 4, "%d", config->audio_channels);
+            // args[i++] = ac_str; -- Cannot do this safely in child after fork without pre-alloc
+            // Safe bet: just omit -ac in this robust version or assume 2?
+            // Wait, I can use a static/stack buffer since we are in a fresh process.
+            char ac_str[8];
+            sprintf(ac_str, "%d", config->audio_channels);
+            args[i++] = "-ac"; args[i++] = ac_str;
+
+            // Output format
+            args[i++] = "-f"; args[i++] = (char*)out_fmt;
+            
+            // Mux options
+            if (mux_opts && mux_opts[0]) {
+               // Tokenize mux opts: "-mpegts_flags +resend_headers ..."
+               // We need a non-const copy to tokenize
+               char mux_copy[256];
+               strncpy(mux_copy, mux_opts, 255);
+               char *token = strtok(mux_copy, " ");
+               while (token && i < 60) {
+                   args[i++] = token;
+                   token = strtok(NULL, " ");
+               }
+            }
+            
+            args[i++] = "-"; // Output to stdout
+            args[i] = NULL;
+            
+            execvp("ffmpeg", args);
+            _exit(1);
+        }
+        
+        // Parent of zap/ffmpeg (Stream Group Leader)
+        close(zap_pipe[0]);
+        close(zap_pipe[1]);
+        close(pipefds[1]); // Close write end
+        
+        // Wait for children? No, we need to exit so the REAL parent can read from pipefds[0]
+        // Actually, the logic in original code was:
+        // pid = fork()
+        //   parent: reads pipefds[0]
+        //   child: exec pipeline
+        
+        // In this new structure:
+        // pid = fork() (Stream Monitor)
+        //   parent: identical to before (reads pipefds[0])
+        //   child: 
+        //      forks zap
+        //      forks ffmpeg
+        //      exits? 
+        
+        // Wait, if the child exits, who reaps the zap/ffmpeg grandchildren? init?
+        // If we want "pid" (the one kill sent to) to represent the group, the child must stay alive using wait().
+        // BUT the parent reads from the pipe. If the child stays alive, does it interfere?
+        // No, the child just needs to NOT close the write end of pipefds if it wants to keep it open?
+        // Actually, ffmpeg has the write end. The Stream Monitor process (intermediate child) 
+        // doesn't need to hold the pipe.
+        // It can just wait() for its children.
+        
+        close(pipefds[0]); // Monitor doesn't read
+        
+        // Wait for both children
+        wait(NULL);
+        wait(NULL);
+        _exit(0);
+    }
+    
     // Parent
-    close(pipefds[1]);
+    close(zap_pipe[0]); 
+    close(zap_pipe[1]); // Ensure these are closed in parent too
     
     // Enable TCP keepalive to detect dead connections
     int keepalive = 1;
