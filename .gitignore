@@ -1,0 +1,18 @@
+# Build artifacts
+build/
+*.o
+zaplink
+
+# Local configuration and data
+channels.conf
+epg.db
+huffman.bin
+
+# Dependencies
+deps/
+
+# System/IDE
+.DS_Store
+.vscode/
+*.swp
+*~

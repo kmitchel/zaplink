@@ -1,0 +1,15 @@
+[Unit]
+Description=ZapLink DTV Engine
+After=network.target
+
+[Service]
+Type=simple
+User=zaplink
+Group=zaplink
+WorkingDirectory=/opt/zaplink
+ExecStart=/opt/zaplink/zaplink
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
