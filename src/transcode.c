@@ -246,10 +246,22 @@ void handle_unified_stream(int sockfd, StreamConfig *config, const char *http_he
                 // Video Filters
                 add_arg(args, &n, "-vf", &err);
                 switch (config->backend) {
-                    case BACKEND_QSV: add_arg(args, &n, "vpp_qsv=deinterlace=2", &err); break;
-                    case BACKEND_NVENC: add_arg(args, &n, "yadif_cuda", &err); break;
-                    case BACKEND_VAAPI: add_arg(args, &n, "deinterlace_vaapi", &err); break;
-                    default: add_arg(args, &n, "yadif,format=yuv420p", &err); break;
+                    case BACKEND_QSV: 
+                        // QSV Advanced deinterlacing (usually respects frame flags)
+                        add_arg(args, &n, "vpp_qsv=deinterlace=2", &err); 
+                        break;
+                    case BACKEND_NVENC: 
+                        // yadif_cuda: mode 0 (frame), parity -1 (auto), deint 1 (interlaced only)
+                        add_arg(args, &n, "yadif_cuda=0:-1:1", &err); 
+                        break;
+                    case BACKEND_VAAPI: 
+                        // VAAPI motion adaptive
+                        add_arg(args, &n, "deinterlace_vaapi", &err); 
+                        break;
+                    default: 
+                        // Software yadif: mode 0 (frame), parity -1 (auto), deint 1 (interlaced only)
+                        add_arg(args, &n, "yadif=0:-1:1,format=yuv420p", &err); 
+                        break;
                 }
                 
                 // Video Encoder & Options
