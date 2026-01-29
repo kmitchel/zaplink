@@ -29,4 +29,7 @@
 /** Global verbose flag (defined in main.c) */
 extern int g_verbose;
 
+/** Global EPG disable flag (defined in main.c) */
+extern int g_no_epg;
+
 #endif

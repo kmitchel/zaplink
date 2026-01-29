@@ -193,39 +193,58 @@ void *client_thread(void *arg) {
     if (strcmp(path, "/playlist.m3u") == 0) {
         handle_m3u(sockfd, host, query);
     } else if (strcmp(path, "/xmltv.xml") == 0) {
-        char *xml = db_get_xmltv_programs();
-        if (xml) { 
-            send_response(sockfd, "200 OK", "application/xml", xml); 
-            free(xml); 
+        if (g_no_epg) {
+            send_response(sockfd, "404 Not Found", "text/plain", "EPG support is disabled via command line (-n)");
         } else {
-            send_response(sockfd, "500 Internal Server Error", "text/plain", "Failed to generate EPG");
+            char *xml = db_get_xmltv_programs();
+            if (xml) { 
+                send_response(sockfd, "200 OK", "application/xml", xml); 
+                free(xml); 
+            } else {
+                send_response(sockfd, "500 Internal Server Error", "text/plain", "Failed to generate EPG");
+            }
         }
     } else if (strncmp(path, "/stream/", 8) == 0) {
         StreamConfig config = {0};
         strncpy(config.channel_num, path + 8, sizeof(config.channel_num)-1);
         
         // Parse params
-        char b_param[64] = {0}, c_param[64] = {0}, br_param[64] = {0};
+        char b_param[64] = {0}, c_param[64] = {0}, br_param[64] = {0}, a_param[64] = {0};
         int has_b = get_query_param(query, "backend", b_param, sizeof(b_param));
         int has_c = get_query_param(query, "codec", c_param, sizeof(c_param));
         int has_br = get_query_param(query, "bitrate", br_param, sizeof(br_param));
+        int has_a = get_query_param(query, "audio", a_param, sizeof(a_param));
 
         config.backend = has_b ? parse_backend(b_param) : BACKEND_SOFTWARE;
         config.codec = has_c ? parse_codec(c_param) : CODEC_COPY;
         config.bitrate_kbps = has_br ? atoi(br_param) : 0;  // 0 = no rate control, use encoder default
-        config.audio_channels = 2;
+        
+        // Audio channels: 2 (stereo), 6 (5.1 surround). Default is 2 for transcoding.
+        // Values like "5.1" or "51" are treated as 6 channels
+        if (has_a) {
+            if (strcmp(a_param, "6") == 0 || strcmp(a_param, "5.1") == 0 || strcmp(a_param, "51") == 0) {
+                config.audio_channels = 6;
+            } else {
+                config.audio_channels = atoi(a_param);
+                if (config.audio_channels < 1 || config.audio_channels > 8) {
+                    config.audio_channels = 2;  // Fallback to stereo for invalid values
+                }
+            }
+        } else {
+            config.audio_channels = 2;  // Default to stereo
+        }
 
-        LOG_INFO("HTTP", "Stream request: %s (backend=%s, codec=%s, bitrate=%s)", 
+        LOG_INFO("HTTP", "Stream request: %s (backend=%s, codec=%s, bitrate=%s, audio=%dch)", 
                  config.channel_num, has_b ? b_param : "none", has_c ? c_param : "copy", 
-                 config.bitrate_kbps > 0 ? br_param : "auto");
+                 config.bitrate_kbps > 0 ? br_param : "auto", config.audio_channels);
 
         // MIME type: Only software AV1 uses Matroska, hardware AV1 uses MPEG-TS
         int is_software_av1 = (config.codec == CODEC_AV1 && config.backend == BACKEND_SOFTWARE);
         char head[256];
         const char *mime = is_software_av1 ? "video/x-matroska" : "video/mp2t";
         snprintf(head, sizeof(head), "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nConnection: keep-alive\r\nAccess-Control-Allow-Origin: *\r\n\r\n", mime);
-        write_all(sockfd, head, strlen(head));
-        handle_unified_stream(sockfd, &config);
+        // Header is passed to handle_unified_stream and sent only after stream data is ready
+        handle_unified_stream(sockfd, &config, head);
     } else {
         send_response(sockfd, "404 Not Found", "text/plain", "ZapLink Engine: Valid endpoints: /stream/{ch}, /playlist.m3u, /xmltv.xml");
     }

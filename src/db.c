@@ -53,6 +53,15 @@ int db_init() {
         sqlite3_free(err_msg);
         return 0;
     }
+
+    // Index for title to speed up series detection (counting occurrences)
+    char *sql_idx = "CREATE INDEX IF NOT EXISTS idx_programs_title ON programs(title);";
+    rc = sqlite3_exec(db, sql_idx, 0, 0, &err_msg);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "SQL error creating index: %s\n", err_msg);
+        sqlite3_free(err_msg);
+        // Not a fatal error, continue
+    }
     
     return 1;
 }
@@ -117,11 +126,21 @@ char *db_get_xmltv_programs() {
     if (!db) return NULL;
 
     sqlite3_stmt *stmt;
-    const char *sql = "SELECT title, description, start_time, end_time, channel_service_id, frequency, event_id FROM programs "
+    // Count occurrences of title to determine if it's a series
+    // Filter by end_time > now to show only current/future programs in XML
+    const char *sql = "SELECT title, description, start_time, end_time, channel_service_id, frequency, event_id, "
+                      "(SELECT COUNT(*) FROM programs p2 WHERE p2.title = programs.title) as title_count "
+                      "FROM programs "
+                      "WHERE end_time > ? "
                       "ORDER BY CAST(SUBSTR(channel_service_id, 1, INSTR(channel_service_id, '.') - 1) AS INTEGER), "
                       "CAST(SUBSTR(channel_service_id, INSTR(channel_service_id, '.') + 1) AS INTEGER), start_time;";
     int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
     if (rc != SQLITE_OK) return NULL;
+
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    long long now_ms = (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+    sqlite3_bind_int64(stmt, 1, now_ms);
 
     size_t cap = 512 * 1024;
     size_t size = 0;
@@ -188,7 +207,12 @@ char *db_get_xmltv_programs() {
         snprintf(ep_str, sizeof(ep_str), "    <episode-num system=\"xmltv_ns\">0.%d.</episode-num>\n", event_id);
         APPEND_OR_FAIL(append_str(&xml, &size, &cap, ep_str));
         APPEND_OR_FAIL(append_str(&xml, &size, &cap, "    <new />\n"));
-        APPEND_OR_FAIL(append_str(&xml, &size, &cap, "    <category>Series</category>\n"));
+        
+        int title_count = sqlite3_column_int(stmt, 7);
+        if (title_count > 1) {
+            APPEND_OR_FAIL(append_str(&xml, &size, &cap, "    <category>Series</category>\n"));
+        }
+        
         APPEND_OR_FAIL(append_str(&xml, &size, &cap, "  </programme>\n"));
     }
 
@@ -363,7 +387,7 @@ int db_cleanup_expired() {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     long long now_ms = (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-    long long cutoff_ms = now_ms - (24LL * 60 * 60 * 1000); // 24 hours ago
+    long long cutoff_ms = now_ms - (48LL * 60 * 60 * 1000); // 48 hours ago to keep history for series detection
 
     char *sql = "DELETE FROM programs WHERE end_time < ?";
     sqlite3_stmt *stmt;
