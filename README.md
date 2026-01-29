@@ -109,6 +109,7 @@ To use ZapLink with Jellyfin:
 1. Go to **Dashboard** > **Live TV**.
 2. Add **Tuner Device** (Select **M3U Tuner**):
    - **File or URL**: `http://<ip>:18392/playlist.m3u`
+     *Note: You can append transcoding parameters here to force them for all channels, e.g., `http://<ip>:18392/playlist.m3u?backend=vaapi&codec=h264`*
 3. Add **TV Guide Data Provider** (Select **XMLTV**):
    - **File or URL**: `http://<ip>:18392/xmltv.xml`
 4. Save and click **Refresh Guide Data**.
