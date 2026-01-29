@@ -69,7 +69,7 @@ static int write_all(int fd, const char *buf, size_t len) {
     return 1;
 }
 
-void handle_unified_stream(int sockfd, StreamConfig *config, const char *http_header) {
+void handle_unified_stream(int sockfd, StreamConfig *config) {
     // SECURITY: Validate channel_num to prevent shell injection
     if (!validate_channel_num(config->channel_num)) {
         LOG_WARN("TRANSCODE", "Invalid channel number format: %s", config->channel_num);
@@ -239,7 +239,6 @@ void handle_unified_stream(int sockfd, StreamConfig *config, const char *http_he
     
     char buffer[16384];
     ssize_t n;
-    int header_sent = 0;
     int client_alive = 1;
     
     // Use poll to monitor both pipe and socket for errors
@@ -271,16 +270,6 @@ void handle_unified_stream(int sockfd, StreamConfig *config, const char *http_he
             if (n <= 0) {
                 if (n < 0 && errno == EINTR) continue;
                 break;  // EOF or error from pipe
-            }
-            
-            // Send HTTP header only after we have data ready
-            if (!header_sent) {
-                if (!write_all(sockfd, http_header, strlen(http_header))) {
-                    LOG_INFO("TRANSCODE", "Client disconnected before stream started");
-                    break;
-                }
-                header_sent = 1;
-                LOG_DEBUG("TRANSCODE", "Stream data ready, sent HTTP header");
             }
             
             if (!write_all(sockfd, buffer, n)) {
