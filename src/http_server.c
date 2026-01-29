@@ -109,7 +109,25 @@ int get_query_param(const char *query, const char *key, char *dest, size_t dest_
     return 1;
 }
 
+// M3U Cache
+static char *g_m3u_cache = NULL;
+static char g_m3u_cache_host[256] = {0};
+static pthread_mutex_t g_m3u_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 void handle_m3u(int sockfd, const char *host, const char *query) {
+    // If query params exist, ignore cache and generate dynamic
+    // Otherwise serve from cache if host matches
+    
+    if ((!query || query[0] == '\0') && host && host[0]) {
+        pthread_mutex_lock(&g_m3u_mutex);
+        if (g_m3u_cache && strcmp(g_m3u_cache_host, host) == 0) {
+            send_response(sockfd, "200 OK", "audio/x-mpegurl", g_m3u_cache);
+            pthread_mutex_unlock(&g_m3u_mutex);
+            return;
+        }
+        pthread_mutex_unlock(&g_m3u_mutex);
+    }
+
     size_t cap = 64 * 1024, size = 0;
     char *m3u = malloc(cap);
     if (!m3u) {
@@ -143,7 +161,18 @@ void handle_m3u(int sockfd, const char *host, const char *query) {
         strcpy(m3u + size, entry);
         size += entry_len;
     }
+    
     send_response(sockfd, "200 OK", "audio/x-mpegurl", m3u);
+
+    // Update cache if this was a clean request (no query)
+    if ((!query || query[0] == '\0') && host && host[0]) {
+        pthread_mutex_lock(&g_m3u_mutex);
+        if (g_m3u_cache) free(g_m3u_cache);
+        g_m3u_cache = strdup(m3u);
+        strncpy(g_m3u_cache_host, host, sizeof(g_m3u_cache_host)-1);
+        pthread_mutex_unlock(&g_m3u_mutex);
+    }
+
     free(m3u);
 }
 

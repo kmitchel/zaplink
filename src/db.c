@@ -68,10 +68,12 @@ int db_init() {
     }
 
     // Index for title to speed up series detection (counting occurrences)
-    char *sql_idx = "CREATE INDEX IF NOT EXISTS idx_programs_title ON programs(title);";
+    char *sql_idx = "CREATE INDEX IF NOT EXISTS idx_programs_title ON programs(title);"
+                    "CREATE INDEX IF NOT EXISTS idx_programs_endtime ON programs(end_time);"
+                    "CREATE INDEX IF NOT EXISTS idx_programs_channel ON programs(channel_service_id);";
     rc = sqlite3_exec(db, sql_idx, 0, 0, &err_msg);
     if (rc != SQLITE_OK) {
-        fprintf(stderr, "SQL error creating index: %s\n", err_msg);
+        fprintf(stderr, "SQL error creating indexes: %s\n", err_msg);
         sqlite3_free(err_msg);
     }
     
