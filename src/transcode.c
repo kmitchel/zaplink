@@ -93,9 +93,14 @@ void handle_unified_stream(int sockfd, StreamConfig *config) {
 
     char cmd[2048];
     
-    // Passthrough mode: no transcoding, pipe dvbv5-zap directly to client
+    // Passthrough mode: minimal ffmpeg remux (copy video+audio) to clean MPEG-TS structure
+    // Raw dvbv5-zap output can have incomplete PSI tables that cause slow probing
     if (config->codec == CODEC_COPY) {
-        snprintf(cmd, sizeof(cmd), "dvbv5-zap -c %s -a %s -o - %s",
+        snprintf(cmd, sizeof(cmd), 
+            "dvbv5-zap -c %s -a %s -o - %s | ffmpeg "
+            "-fflags +genpts+discardcorrupt -analyzeduration 1M -probesize 5M "
+            "-f mpegts -i - -c copy "
+            "-f mpegts -mpegts_flags +resend_headers -pat_period 0.1 -sdt_period 0.5 -",
             channels_conf_path, adapter_id, c->number);
         LOG_INFO("TRANSCODE", "Starting passthrough stream: %s", config->channel_num);
     } else {
@@ -237,10 +242,6 @@ void handle_unified_stream(int sockfd, StreamConfig *config) {
     struct timeval tv = { .tv_sec = 10, .tv_usec = 0 };
     setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     
-    char buffer[16384];
-    ssize_t n;
-    int client_alive = 1;
-    
     // Use poll to monitor both pipe and socket for errors
     struct pollfd fds[2];
     fds[0].fd = pipefds[0];  // Pipe from dvbv5-zap/ffmpeg
@@ -248,7 +249,10 @@ void handle_unified_stream(int sockfd, StreamConfig *config) {
     fds[1].fd = sockfd;      // Client socket
     fds[1].events = 0;       // Only care about errors/hangup (always reported)
     
-    while (client_alive) {
+    char buffer[65536];
+    ssize_t n;
+    
+    while (1) {
         // Poll with 5 second timeout to periodically check socket health
         int ret = poll(fds, 2, 5000);
         
@@ -269,9 +273,8 @@ void handle_unified_stream(int sockfd, StreamConfig *config) {
             n = read(pipefds[0], buffer, sizeof(buffer));
             if (n <= 0) {
                 if (n < 0 && errno == EINTR) continue;
-                break;  // EOF or error from pipe
+                break;  // EOF or error
             }
-            
             if (!write_all(sockfd, buffer, n)) {
                 LOG_INFO("TRANSCODE", "Client disconnected, killing stream group %d", pid);
                 break;
@@ -280,7 +283,7 @@ void handle_unified_stream(int sockfd, StreamConfig *config) {
         
         // Check for pipe errors (process died)
         if (fds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) {
-            // Drain any remaining data before exiting
+            // Drain any remaining data
             while ((n = read(pipefds[0], buffer, sizeof(buffer))) > 0) {
                 if (!write_all(sockfd, buffer, n)) break;
             }
