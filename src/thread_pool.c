@@ -19,9 +19,9 @@ struct thread_pool {
     job_t *job_tail;
     int num_threads;
     int shutdown;
-    int working_count;
-    int queue_count;
-    int max_queue_size;
+    int working_count;  // Number of threads currently executing a job
+    int queue_count;    // Number of jobs waiting in the queue
+    int max_queue_size; // Maximum allowed queue depth before rejection
 };
 
 static void *thread_worker(void *arg) {

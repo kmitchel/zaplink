@@ -52,7 +52,7 @@ int db_init() {
     // Create Table if not exists
     char *sql = "CREATE TABLE IF NOT EXISTS programs ("
                 "frequency TEXT, "
-                "channel_service_id TEXT, "
+                "channel_service_id TEXT, " // NOTE: Currently stores Virtual Channel Number (e.g. "15.1"), not DVB Service ID
                 "start_time INTEGER, "
                 "end_time INTEGER, "
                 "title TEXT, "
