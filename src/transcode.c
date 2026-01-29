@@ -69,12 +69,15 @@ static int write_all(int fd, const char *buf, size_t len) {
     return 1;
 }
 
-// Helper to append args to argv
+// Helper to append args to argv with safety check
+// Helper to append args to argv with overflow tracking
 static void add_arg(char **argv, int *argc, const char *arg) {
-    if (*argc < 63) {
-        argv[(*argc)++] = (char *)arg;
-        argv[*argc] = NULL;
+    if (*argc < 127) {
+        argv[*argc] = (char *)arg;
+        argv[*argc + 1] = NULL;
     }
+    // Always increment counter to detect overflow
+    (*argc)++;
 }
 
 void handle_unified_stream(int sockfd, StreamConfig *config, const char *http_header) {
@@ -182,7 +185,7 @@ void handle_unified_stream(int sockfd, StreamConfig *config, const char *http_he
             close(pipefds[1]);
 
             // Construct argv for execvp directly
-            char *args[64];
+            char *args[128];
             int n = 0;
             
             add_arg(args, &n, "ffmpeg");
@@ -331,6 +334,12 @@ void handle_unified_stream(int sockfd, StreamConfig *config, const char *http_he
             
             add_arg(args, &n, "-"); // Output to stdout
             args[n] = NULL;
+            
+            // Check for argument overflow (n tracked total attempts)
+            if (n >= 127) {
+                LOG_ERROR("TRANSCODE", "Argument overflow detected (%d >= 127), aborting stream", n);
+                _exit(1);
+            }
             
             execvp("ffmpeg", args);
             _exit(1);
