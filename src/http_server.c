@@ -4,52 +4,58 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/socket.h>
-#include <sys/select.h>
+#include <sys/epoll.h>
 #include <netinet/in.h>
-#include <pthread.h>
 #include <errno.h>
-#include <semaphore.h>
-#include <signal.h>
 #include <fcntl.h>
+#include <signal.h>
 #include "http_server.h"
 #include "transcode.h"
 #include "channels.h"
 #include "db.h"
 #include "log.h"
 #include "config.h"
+#include "thread_pool.h"
 
-// Connection limiting
-#define MAX_CONCURRENT_CONNECTIONS 32
-static sem_t connection_sem;
+#define MAX_EVENTS 64
+#define MAX_HEADER_SIZE 4096
+#define THREAD_POOL_SIZE 16
 
-// Self-pipe for signal-safe shutdown
+static int epoll_fd = -1;
+static int server_fd = -1;
 static int shutdown_pipe[2] = {-1, -1};
 static volatile sig_atomic_t http_running = 1;
+static thread_pool_t *pool = NULL;
 
-// Signal handler writes to pipe to wake up select()
-static void http_signal_handler(int sig) {
-    (void)sig;
-    http_running = 0;
-    // Write a byte to wake up select() - async-signal-safe
-    char c = 1;
-    if (shutdown_pipe[1] >= 0) {
-        ssize_t n = write(shutdown_pipe[1], &c, 1);
-        (void)n; // Ignore result in signal handler
+typedef struct {
+    int fd;
+    char buffer[MAX_HEADER_SIZE];
+    size_t total_read;
+} client_context_t;
+
+static void set_nonblocking(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags != -1) {
+        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
     }
 }
 
-/**
- * Write all bytes to socket, handling partial writes and EINTR.
- * With SO_SNDTIMEO set, write() will timeout after the configured duration.
- * Returns 1 on success, 0 on error/timeout (client disconnected or slow).
- */
+static void http_signal_handler(int sig) {
+    (void)sig;
+    http_running = 0;
+    char c = 1;
+    if (shutdown_pipe[1] >= 0) {
+        if (write(shutdown_pipe[1], &c, 1) < 0) {} 
+    }
+}
+
 static int write_all(int fd, const char *buf, size_t len) {
     size_t written = 0;
     while (written < len) {
         ssize_t n = write(fd, buf + written, len - written);
         if (n < 0) {
             if (errno == EINTR) continue;
-            return 0; // Error, timeout, or disconnect
+            return 0; 
         }
         written += n;
     }
@@ -64,6 +70,43 @@ void send_response(int sockfd, const char *status, const char *type, const char 
         status, type, len);
     write_all(sockfd, header, strlen(header));
     if (body) write_all(sockfd, body, len);
+}
+
+// ... URL utilities ...
+static void url_decode(char *s) {
+    char *dst = s;
+    while (*s) {
+        if (*s == '%' && s[1] && s[2]) {
+            int val;
+            if (sscanf(s + 1, "%2x", &val) == 1) {
+                *dst++ = (char)val;
+                s += 3;
+                continue;
+            }
+        } else if (*s == '+') {
+            *dst++ = ' ';
+            s++;
+            continue;
+        }
+        *dst++ = *s++;
+    }
+    *dst = '\0';
+}
+
+int get_query_param(const char *query, const char *key, char *dest, size_t dest_len) {
+    if (!query || !key || !dest || dest_len == 0) return 0;
+    char search[64];
+    snprintf(search, sizeof(search), "%s=", key);
+    char *p = strstr(query, search);
+    if (!p) return 0;
+    p += strlen(search);
+    char *end = strchr(p, '&');
+    size_t len = end ? (size_t)(end - p) : strlen(p);
+    if (len >= dest_len) len = dest_len - 1;
+    strncpy(dest, p, len);
+    dest[len] = '\0';
+    url_decode(dest);
+    return 1;
 }
 
 void handle_m3u(int sockfd, const char *host, const char *query) {
@@ -104,90 +147,33 @@ void handle_m3u(int sockfd, const char *host, const char *query) {
     free(m3u);
 }
 
-/**
- * URL decode a string in-place (handles %XX escapes).
- */
-static void url_decode(char *s) {
-    char *dst = s;
-    while (*s) {
-        if (*s == '%' && s[1] && s[2]) {
-            int val;
-            if (sscanf(s + 1, "%2x", &val) == 1) {
-                *dst++ = (char)val;
-                s += 3;
-                continue;
-            }
-        } else if (*s == '+') {
-            *dst++ = ' ';
-            s++;
-            continue;
-        }
-        *dst++ = *s++;
-    }
-    *dst = '\0';
-}
+// Worker function: Processes fully received requests
+void process_client_request(void *arg) {
+    client_context_t *ctx = (client_context_t *)arg;
+    int sockfd = ctx->fd;
+    char *buffer = ctx->buffer;
+    
+    // Set back to blocking for processing logic
+    int flags = fcntl(sockfd, F_GETFL, 0);
+    fcntl(sockfd, F_SETFL, flags & ~O_NONBLOCK);
+    
+    // Use timeouts for the processing phase
+    struct timeval tv = { .tv_sec = 30, .tv_usec = 0 };
+    setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
-int get_query_param(const char *query, const char *key, char *dest, size_t dest_len) {
-    if (!query || !key || !dest || dest_len == 0) return 0;
-    char search[64];
-    snprintf(search, sizeof(search), "%s=", key);
-    char *p = strstr(query, search);
-    if (!p) return 0;
-    p += strlen(search);
-    char *end = strchr(p, '&');
-    size_t len = end ? (size_t)(end - p) : strlen(p);
-    if (len >= dest_len) len = dest_len - 1;
-    strncpy(dest, p, len);
-    dest[len] = '\0';
-    url_decode(dest);
-    return 1;
-}
-
-void *client_thread(void *arg) {
-    int sockfd = *(int*)arg;
-    free(arg);
+    // Logic from old client_thread...
     
-    char buffer[4096];
-    size_t total_read = 0;
-    
-    // Read loop: read until we find \r\n\r\n or buffer fills up
-    while (total_read < sizeof(buffer) - 1) {
-        ssize_t n = read(sockfd, buffer + total_read, sizeof(buffer) - 1 - total_read);
-        if (n <= 0) {
-            // EOF or error before complete header
-            close(sockfd);
-            sem_post(&connection_sem);
-            return NULL;
-        }
-        total_read += n;
-        buffer[total_read] = '\0';
-        
-        // Check for double CRLF (end of headers)
-        if (strstr(buffer, "\r\n\r\n")) {
-            break;
-        }
-        
-        // Safety timeout check could be added here if we had non-blocking sockets
-        // For now, SO_RCVTIMEO on socket handles timeout
-    }
-    
-    if (total_read >= sizeof(buffer) - 1) {
-        // Headers too long
-        send_response(sockfd, "431 Request Header Fields Too Large", "text/plain", "Headers exceeded limit");
-        close(sockfd);
-        sem_post(&connection_sem);
-        return NULL;
-    }
-    
-    // Use width specifiers to prevent buffer overflow
-    char method[16], full_path[1024], protocol[16];
+    // Parse Request
+    char method[16], full_path[1024], protocol[16]; // Increased buffers just in case
+    // Note: buffer is guaranteed null-terminated by the reader loop
     if (sscanf(buffer, "%15s %1023s %15s", method, full_path, protocol) != 3) {
         send_response(sockfd, "400 Bad Request", "text/plain", "Malformed request");
         close(sockfd);
-        sem_post(&connection_sem);
-        return NULL;
+        free(ctx);
+        return;
     }
-    
+
     // Parse Host header
     char host[256] = "localhost:18392";
     char *host_hdr = strcasestr(buffer, "Host: ");
@@ -231,7 +217,6 @@ void *client_thread(void *arg) {
         StreamConfig config = {0};
         strncpy(config.channel_num, path + 8, sizeof(config.channel_num)-1);
         
-        // Parse params
         char b_param[64] = {0}, c_param[64] = {0}, br_param[64] = {0}, a_param[64] = {0};
         int has_b = get_query_param(query, "backend", b_param, sizeof(b_param));
         int has_c = get_query_param(query, "codec", c_param, sizeof(c_param));
@@ -240,53 +225,44 @@ void *client_thread(void *arg) {
 
         config.backend = has_b ? parse_backend(b_param) : BACKEND_SOFTWARE;
         config.codec = has_c ? parse_codec(c_param) : CODEC_COPY;
-        config.bitrate_kbps = has_br ? atoi(br_param) : 0;  // 0 = no rate control, use encoder default
-        
-        // Audio channels: 2 (stereo), 6 (5.1 surround). Default is 2 for transcoding.
-        // Values like "5.1" or "51" are treated as 6 channels
+        config.bitrate_kbps = has_br ? atoi(br_param) : 0;
+
         if (has_a) {
             if (strcmp(a_param, "6") == 0 || strcmp(a_param, "5.1") == 0 || strcmp(a_param, "51") == 0) {
                 config.audio_channels = 6;
             } else {
                 config.audio_channels = atoi(a_param);
-                if (config.audio_channels < 1 || config.audio_channels > 8) {
-                    config.audio_channels = 2;  // Fallback to stereo for invalid values
-                }
+                if (config.audio_channels < 1 || config.audio_channels > 8) config.audio_channels = 2;
             }
         } else {
-            config.audio_channels = 2;  // Default to stereo
+            config.audio_channels = 2;
         }
 
         LOG_INFO("HTTP", "Stream request: %s (backend=%s, codec=%s, bitrate=%s, audio=%dch)", 
                  config.channel_num, has_b ? b_param : "none", has_c ? c_param : "copy", 
                  config.bitrate_kbps > 0 ? br_param : "auto", config.audio_channels);
 
-        // MIME type: Only software AV1 uses Matroska, hardware AV1 uses MPEG-TS
         int is_software_av1 = (config.codec == CODEC_AV1 && config.backend == BACKEND_SOFTWARE);
         char head[256];
         const char *mime = is_software_av1 ? "video/x-matroska" : "video/mp2t";
         snprintf(head, sizeof(head), "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nConnection: keep-alive\r\nAccess-Control-Allow-Origin: *\r\n\r\n", mime);
-        // Pass header to stream handler - sent after first data chunk arrives
         handle_unified_stream(sockfd, &config, head);
     } else {
         send_response(sockfd, "404 Not Found", "text/plain", "ZapLink Engine: Valid endpoints: /stream/{ch}, /playlist.m3u, /xmltv.xml");
     }
+
     close(sockfd);
-    sem_post(&connection_sem);
-    return NULL;
+    free(ctx);
 }
 
 void start_http_server(int port) {
-    // Create self-pipe for shutdown signaling
     if (pipe(shutdown_pipe) < 0) {
         LOG_ERROR("HTTP", "Failed to create shutdown pipe");
         return;
     }
-    // Make pipe non-blocking
-    fcntl(shutdown_pipe[0], F_SETFL, O_NONBLOCK);
-    fcntl(shutdown_pipe[1], F_SETFL, O_NONBLOCK);
+    set_nonblocking(shutdown_pipe[0]);
+    set_nonblocking(shutdown_pipe[1]);
 
-    // Install our signal handlers
     struct sigaction sa;
     sa.sa_handler = http_signal_handler;
     sigemptyset(&sa.sa_mask);
@@ -294,114 +270,139 @@ void start_http_server(int port) {
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
 
-    // Initialize connection semaphore
-    if (sem_init(&connection_sem, 0, MAX_CONCURRENT_CONNECTIONS) < 0) {
-        LOG_ERROR("HTTP", "Failed to initialize connection semaphore");
-        close(shutdown_pipe[0]);
-        close(shutdown_pipe[1]);
+    pool = thread_pool_create(THREAD_POOL_SIZE);
+    if (!pool) {
+        LOG_ERROR("HTTP", "Failed to create thread pool");
         return;
     }
 
-    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) {
         LOG_ERROR("HTTP", "Failed to create socket: %s", strerror(errno));
-        sem_destroy(&connection_sem);
-        close(shutdown_pipe[0]);
-        close(shutdown_pipe[1]);
         return;
     }
     
     int opt = 1;
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    set_nonblocking(server_fd);
 
     struct sockaddr_in address = { .sin_family = AF_INET, .sin_addr.s_addr = INADDR_ANY, .sin_port = htons(port) };
     if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
         LOG_ERROR("HTTP", "Failed to bind to port %d: %s", port, strerror(errno));
         close(server_fd);
-        sem_destroy(&connection_sem);
-        close(shutdown_pipe[0]);
-        close(shutdown_pipe[1]);
         return;
     }
     
     if (listen(server_fd, 10) < 0) {
         LOG_ERROR("HTTP", "Failed to listen: %s", strerror(errno));
         close(server_fd);
-        sem_destroy(&connection_sem);
-        close(shutdown_pipe[0]);
-        close(shutdown_pipe[1]);
         return;
     }
 
-    LOG_INFO("HTTP", "Listening on port %d (max %d connections)", port, MAX_CONCURRENT_CONNECTIONS);
+    epoll_fd = epoll_create1(0);
+    if (epoll_fd < 0) {
+        LOG_ERROR("HTTP", "Failed to create epoll: %s", strerror(errno));
+        close(server_fd);
+        return;
+    }
+
+    struct epoll_event ev, events[MAX_EVENTS];
+    ev.events = EPOLLIN;
+    ev.data.fd = server_fd; // Listener
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &ev) < 0) {
+        LOG_ERROR("HTTP", "epoll_ctl: listener");
+        close(server_fd);
+        close(epoll_fd);
+        return;
+    }
+
+    ev.data.fd = shutdown_pipe[0];
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, shutdown_pipe[0], &ev) < 0) {
+        LOG_ERROR("HTTP", "epoll_ctl: pipe");
+    }
+
+    LOG_INFO("HTTP", "Listening optimized (epoll+pool) on port %d", port);
 
     while (http_running) {
-        // Use select to wait on both server socket and shutdown pipe
-        fd_set readfds;
-        FD_ZERO(&readfds);
-        FD_SET(server_fd, &readfds);
-        FD_SET(shutdown_pipe[0], &readfds);
-        int maxfd = (server_fd > shutdown_pipe[0]) ? server_fd : shutdown_pipe[0];
-
-        int ret = select(maxfd + 1, &readfds, NULL, NULL, NULL);
-        if (ret < 0) {
+        int nfds = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
+        if (nfds < 0) {
             if (errno == EINTR) continue;
-            LOG_ERROR("HTTP", "select failed: %s", strerror(errno));
+            LOG_ERROR("HTTP", "epoll_wait failed");
             break;
         }
 
-        // Check if shutdown was requested
-        if (FD_ISSET(shutdown_pipe[0], &readfds) || !http_running) {
-            LOG_INFO("HTTP", "Shutdown requested, exiting accept loop");
-            break;
-        }
-
-        // Check for new connection
-        if (!FD_ISSET(server_fd, &readfds)) continue;
-
-        // Wait for an available connection slot, handling EINTR
-        while (sem_wait(&connection_sem) == -1) {
-            if (errno != EINTR) {
-                LOG_ERROR("HTTP", "sem_wait failed: %s", strerror(errno));
+        for (int i = 0; i < nfds; i++) {
+            if (events[i].data.fd == shutdown_pipe[0] || !http_running) {
+                LOG_INFO("HTTP", "Shutdown requested");
                 goto cleanup;
             }
-            if (!http_running) goto cleanup;
+
+            if (events[i].data.fd == server_fd) {
+                // Accept connection
+                struct sockaddr_in client_addr;
+                socklen_t client_len = sizeof(client_addr);
+                int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
+                if (client_fd < 0) {
+                    if (errno != EAGAIN && errno != EWOULDBLOCK) LOG_WARN("HTTP", "accept failed");
+                    continue;
+                }
+                
+                set_nonblocking(client_fd);
+                client_context_t *ctx = calloc(1, sizeof(client_context_t));
+                if (!ctx) {
+                    close(client_fd);
+                    continue;
+                }
+                ctx->fd = client_fd;
+
+                struct epoll_event client_ev;
+                client_ev.events = EPOLLIN | EPOLLET;
+                client_ev.data.ptr = ctx; // Use ptr to store context
+                if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &client_ev) < 0) {
+                    close(client_fd);
+                    free(ctx);
+                }
+            } else {
+                // Read from client
+                client_context_t *ctx = (client_context_t *)events[i].data.ptr;
+                
+                ssize_t n = read(ctx->fd, ctx->buffer + ctx->total_read, sizeof(ctx->buffer) - 1 - ctx->total_read);
+                if (n <= 0) {
+                    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) continue;
+                    // Error or close
+                    close(ctx->fd);
+                    free(ctx);
+                    continue;
+                }
+                
+                ctx->total_read += n;
+                ctx->buffer[ctx->total_read] = '\0';
+                
+                if (strstr(ctx->buffer, "\r\n\r\n")) {
+                    // Full header received.
+                    // Remove from epoll to stop monitoring
+                    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, ctx->fd, NULL);
+                    
+                    // Dispatch to thread pool
+                    if (thread_pool_submit(pool, process_client_request, ctx) < 0) {
+                        LOG_WARN("HTTP", "Thread pool full, dropping request");
+                        send_response(ctx->fd, "503 Service Unavailable", "text/plain", "Server busy");
+                        close(ctx->fd);
+                        free(ctx);
+                    }
+                } else if (ctx->total_read >= sizeof(ctx->buffer) - 1) {
+                    send_response(ctx->fd, "431 Request Header Fields Too Large", "text/plain", "Too large");
+                    close(ctx->fd);
+                    free(ctx);
+                }
+            }
         }
-        
-        int *client_fd = malloc(sizeof(int));
-        if (!client_fd) {
-            LOG_WARN("HTTP", "Memory allocation failed for client");
-            sem_post(&connection_sem);
-            usleep(100000);
-            continue;
-        }
-        *client_fd = accept(server_fd, NULL, NULL);
-        if (*client_fd < 0) {
-            free(client_fd);
-            sem_post(&connection_sem);
-            if (errno == EINTR && !http_running) break;
-            continue;
-        }
-        
-        // Set socket timeouts: recv and send to prevent hanging threads
-        struct timeval tv = { .tv_sec = 30, .tv_usec = 0 };
-        setsockopt(*client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        setsockopt(*client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-        
-        pthread_t thread;
-        if (pthread_create(&thread, NULL, client_thread, client_fd) != 0) {
-            LOG_WARN("HTTP", "Failed to create client thread");
-            close(*client_fd);
-            free(client_fd);
-            sem_post(&connection_sem);
-            continue;
-        }
-        pthread_detach(thread);
     }
 
 cleanup:
+    thread_pool_destroy(pool);
+    close(epoll_fd);
     close(server_fd);
-    sem_destroy(&connection_sem);
     close(shutdown_pipe[0]);
     close(shutdown_pipe[1]);
     LOG_INFO("HTTP", "Server stopped");

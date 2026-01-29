@@ -11,7 +11,8 @@ SERVICE_DIR = /etc/systemd/system
 
 SRCS = $(SRC_DIR)/main.c $(SRC_DIR)/channels.c $(SRC_DIR)/db.c $(SRC_DIR)/epg.c \
        $(SRC_DIR)/huffman.c $(SRC_DIR)/scanner.c $(SRC_DIR)/tuner.c \
-       $(SRC_DIR)/transcode.c $(SRC_DIR)/http_server.c $(SRC_DIR)/benchmark.c
+       $(SRC_DIR)/transcode.c $(SRC_DIR)/http_server.c $(SRC_DIR)/benchmark.c \
+       $(SRC_DIR)/thread_pool.c
 
 OBJS = $(patsubst $(SRC_DIR)/%.c, $(OBJ_DIR)/%.o, $(SRCS))
 
