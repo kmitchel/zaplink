@@ -5,21 +5,11 @@
  * Collects EPG data by parsing ATSC PSIP (Program and System Information Protocol)
  * tables from the transport stream. Scans each frequency (mux) every 15 minutes.
  * 
- * ATSC Tables Parsed:
- * - MGT (0xC7): Master Guide Table - lists PIDs for EIT tables
- * - VCT (0xC8/0xC9): Virtual Channel Table - maps source_id to channel number
- * - EIT (0xCB): Event Information Table - program titles and times
- * - ETT (0xCC): Extended Text Table - program descriptions
- * 
  * Architecture:
  * - Orchestrator thread: Enqueues mux scan jobs, manages 15-min cycle
  * - Worker threads: One per tuner, dequeue and execute scan jobs
- * - Preemption: Workers can be interrupted by stream requests
- * 
- * Channel Mapping:
- * Uses channels.conf SERVICE_ID for accurate frequency+service_id → channel
- * mapping. This prevents cross-frequency source_id collisions where the same
- * source_id appears on different frequencies with different meanings.
+ * - Buffering: Programs are accumulated in memory during the scan and upserted 
+ *   to the DB in a single batch (bulk upsert) at the end of the scan to reduce I/O.
  */
 
 #include <stdio.h>
@@ -66,8 +56,9 @@ typedef struct {
     SectionBuffer pid_buffers[8192];  /* Buffer per possible PID */
     int eit_pids[MAX_EIT_PIDS];       /* Discovered EIT PIDs from MGT */
     int eit_pid_count;                /* Number of EIT PIDs found */
-    int programs_found;               /* Number of programs upserted */
+    int programs_found;               /* Number of programs found (stat) */
     const char *freq;                 /* Current frequency being scanned */
+    ProgramList list;                 /* Buffered programs */
 } ScanContext;
 
 /**
@@ -112,6 +103,52 @@ static pthread_cond_t cycle_cond = PTHREAD_COND_INITIALIZER;
 static pthread_t worker_threads[MAX_TUNERS];
 
 // -----------------------------------------------------------------------------
+// Buffer Management
+// -----------------------------------------------------------------------------
+
+void ctx_upsert(ScanContext *ctx, Program *p) {
+    if (!ctx) return;
+    
+    // Deduplicate: Check if we already have this event/source pair
+    // Linear scan is acceptable here as N < ~200 per mux
+    for (int i = 0; i < ctx->list.count; i++) {
+        if (ctx->list.programs[i].event_id == p->event_id &&
+            ctx->list.programs[i].source_id == p->source_id &&
+            strcmp(ctx->list.programs[i].frequency, p->frequency) == 0 &&
+            strcmp(ctx->list.programs[i].channel_service_id, p->channel_service_id) == 0) { // Check composite keys just in case
+             return;
+        }
+        // Simpler check: event_id + source_id within this MUX scan is unique roughly
+        if (ctx->list.programs[i].event_id == p->event_id && 
+            ctx->list.programs[i].source_id == p->source_id) {
+            return;
+        }
+    }
+    
+    if (ctx->list.count >= ctx->list.capacity) {
+        int new_cap = ctx->list.capacity == 0 ? 64 : ctx->list.capacity * 2;
+        Program *new_ptr = realloc(ctx->list.programs, new_cap * sizeof(Program));
+        if (!new_ptr) return; // OOM
+        ctx->list.programs = new_ptr;
+        ctx->list.capacity = new_cap;
+    }
+    
+    ctx->list.programs[ctx->list.count++] = *p;
+    ctx->programs_found++;
+}
+
+void ctx_update_description(ScanContext *ctx, int event_id, const char *desc) {
+    if (!ctx || !desc || !desc[0]) return;
+    for (int i = 0; i < ctx->list.count; i++) {
+        if (ctx->list.programs[i].event_id == event_id) {
+            strncpy(ctx->list.programs[i].description, desc, sizeof(ctx->list.programs[i].description) - 1);
+            ctx->list.programs[i].description[sizeof(ctx->list.programs[i].description) - 1] = '\0';
+            return;
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
 // Prototypes
 // -----------------------------------------------------------------------------
 
@@ -123,7 +160,7 @@ void parse_atsc_eit(ScanContext *ctx, unsigned char *section, int len);
 void parse_atsc_ett(ScanContext *ctx, unsigned char *section, int len);
 
 // -----------------------------------------------------------------------------
-// Source Map Helpers (Thread-Safe)
+// Source Map Helpers 
 // -----------------------------------------------------------------------------
 
 void add_source_map(const char *freq, int source_id, const char *chan_num) {
@@ -153,22 +190,6 @@ int get_source_map(const char *freq, int source_id, char *result, size_t result_
     pthread_mutex_lock(&source_map_mutex);
     for(int i=0; i<source_map_count; i++) {
         if (strcmp(source_map[i].key, key) == 0) {
-            strncpy(result, source_map[i].val, result_len - 1);
-            result[result_len - 1] = '\0';
-            pthread_mutex_unlock(&source_map_mutex);
-            return 1;
-        }
-    }
-    pthread_mutex_unlock(&source_map_mutex);
-    return 0;
-}
-
-int get_first_channel_on_freq(const char *freq, char *result, size_t result_len) {
-    if (!result || result_len == 0) return 0;
-    size_t freq_len = strlen(freq);
-    pthread_mutex_lock(&source_map_mutex);
-    for(int i=0; i<source_map_count; i++) {
-        if (strncmp(source_map[i].key, freq, freq_len) == 0 && source_map[i].key[freq_len] == '_') {
             strncpy(result, source_map[i].val, result_len - 1);
             result[result_len - 1] = '\0';
             pthread_mutex_unlock(&source_map_mutex);
@@ -225,12 +246,9 @@ void *scanner_worker(void *arg) {
 
         Tuner *t = acquire_tuner(USER_EPG);
         if (!t) {
-            // Should not happen as we have as many threads as tuners, 
-            // but just in case, requeue and wait
             pthread_mutex_lock(&queue_mutex);
             active_scan_jobs--;
             pthread_mutex_unlock(&queue_mutex);
-            
             usleep(1000000);
             enqueue_mux(job.freq, job.name, job.number);
             continue;
@@ -241,13 +259,11 @@ void *scanner_worker(void *arg) {
         
         scan_mux(t, ctx, job.number, job.name);
         
-        // Decrement active jobs counter
         pthread_mutex_lock(&queue_mutex);
         active_scan_jobs--;
         pthread_mutex_unlock(&queue_mutex);
 
-        // Re-check if we were preempted
-        
+        if (ctx->list.programs) free(ctx->list.programs);
         free(ctx);
         release_tuner(t);
     }
@@ -261,13 +277,9 @@ void *scanner_worker(void *arg) {
 void *epg_orchestrator(void *arg) {
     (void)arg;
     
-    // Coordination: if skipping first scan, we sleep 15 mins first.
-    // If not skipping, we scan immediately.
-    
     if (epg_skip_first) {
         LOG_DEBUG("EPG", "Database has data, skipping initial scan cycle");
         fflush(stdout);
-        // Sleep 15 mins (broken into chunks to allow exit)
         for(int k=0; k<15*60; k++) {
             if (!epg_running) break;
             sleep(1);
@@ -275,7 +287,7 @@ void *epg_orchestrator(void *arg) {
     }
 
     while (epg_running) {
-        LOG_INFO("EPG", "Starting full scan cycle (fetching new program data for all channels)...");
+        LOG_INFO("EPG", "Starting full scan cycle...");
         fflush(stdout);
         db_cleanup_expired();
 
@@ -283,7 +295,6 @@ void *epg_orchestrator(void *arg) {
         source_map_count = 0;
         pthread_mutex_unlock(&source_map_mutex);
 
-        // 1. Identify unique muxes and enqueue
         char scanned_freqs[MAX_CHANNELS][32];
         int scanned_count = 0;
 
@@ -300,7 +311,6 @@ void *epg_orchestrator(void *arg) {
             enqueue_mux(c->frequency, c->name, c->number);
         }
 
-        // Wait for all jobs to be processed
         while (1) {
             pthread_mutex_lock(&queue_mutex);
             int count = mux_queue_count + active_scan_jobs;
@@ -313,7 +323,6 @@ void *epg_orchestrator(void *arg) {
         LOG_INFO("EPG", "Scan cycle complete");
         fflush(stdout);
 
-        // Notify that a cycle has completed
         pthread_mutex_lock(&cycle_mutex);
         epg_completed_cycles++;
         pthread_cond_broadcast(&cycle_cond);
@@ -337,15 +346,12 @@ void wait_for_first_epg_scan() {
         pthread_cond_wait(&cycle_cond, &cycle_mutex);
     }
     pthread_mutex_unlock(&cycle_mutex);
-    LOG_DEBUG("EPG", "First scan cycle detected, proceeding");
-    fflush(stdout);
 }
 
 void start_epg_thread() {
     if (epg_running) return;
     epg_running = 1;
     
-    // Check if we already have data to skip the initial scan
     if (db_has_data()) {
         epg_skip_first = 1;
         LOG_INFO("EPG", "Existing program data found, initial scan deferred for 15 minutes");
@@ -354,14 +360,12 @@ void start_epg_thread() {
         LOG_INFO("EPG", "No program data found, starting initial scan immediately");
     }
 
-    // Start scanner threads (one per tuner)
     for (int i = 0; i < tuner_count; i++) {
         int *id = malloc(sizeof(int));
         *id = i;
         pthread_create(&worker_threads[i], NULL, scanner_worker, id);
     }
     
-    // Start orchestrator thread
     pthread_t orch_tid;
     pthread_create(&orch_tid, NULL, epg_orchestrator, NULL);
     pthread_detach(orch_tid);
@@ -375,8 +379,10 @@ void stop_epg_thread() {
     }
 }
 
-// Decode ATSC Multiple String Structure (MSS)
-// Ref: A/65 Section 6.10
+// -----------------------------------------------------------------------------
+// Parsers
+// -----------------------------------------------------------------------------
+
 static void atsc_mss_to_string(const unsigned char *buf, int len, char *dest, size_t dest_len) {
     if (len < 1 || !dest || dest_len == 0) return;
     dest[0] = '\0';
@@ -384,25 +390,20 @@ static void atsc_mss_to_string(const unsigned char *buf, int len, char *dest, si
     int num_strings = buf[0];
     int pos = 1;
 
-    // We take the first string for simplicity (usually there's only one, or first is preferred)
     for (int i = 0; i < num_strings; i++) {
         if (pos + 4 > len) break;
-        // ISO_639_language_code (3 bytes)
-        // char lang[4] = { buf[pos], buf[pos+1], buf[pos+2], 0 };
         int num_segments = buf[pos+3];
         pos += 4;
 
         for (int j = 0; j < num_segments; j++) {
             if (pos + 3 > len) break;
             unsigned char compr = buf[pos];
-            // unsigned char mode = buf[pos+1];
             int n_bytes = buf[pos+2];
             pos += 3;
 
             if (pos + n_bytes > len) break;
 
             if (compr == 0x00) {
-                // No compression
                 int to_copy = (n_bytes < (int)(dest_len - strlen(dest) - 1)) ? n_bytes : (int)(dest_len - strlen(dest) - 1);
                 if (to_copy > 0) {
                     size_t cur_len = strlen(dest);
@@ -410,35 +411,21 @@ static void atsc_mss_to_string(const unsigned char *buf, int len, char *dest, si
                     dest[cur_len + to_copy] = '\0';
                 }
             } else if (compr == 0x01 || compr == 0x02) {
-                // Huffman (A/65 Annex C)
                 if (!huffman_decode(compr, buf + pos, n_bytes, dest, dest_len)) {
                     LOG_WARN("EPG", "Failed to decode Huffman segment type 0x%02X", compr);
-                    const char *msg = "[Compressed]";
-                    if (dest_len - strlen(dest) > strlen(msg) + 1) strcat(dest, msg);
                 }
             }
-            
             pos += n_bytes;
         }
-        
-        // If we processed one string, we stop (usually one lang is enough)
         break;
     }
 
-    // Sanitize
     for (int i = 0; dest[i]; i++) {
         if ((unsigned char)dest[i] < 0x20 || (unsigned char)dest[i] > 0x7E) dest[i] = ' ';
     }
-    // Trim
     int d_len = strlen(dest);
-    while (d_len > 0 && dest[d_len-1] == ' ') {
-        dest[--d_len] = '\0';
-    }
+    while (d_len > 0 && dest[d_len-1] == ' ') dest[--d_len] = '\0';
 }
-
-// -----------------------------------------------------------------------------
-// TS / PSI Parser Implementation
-// -----------------------------------------------------------------------------
 
 void handle_section(ScanContext *ctx, int pid, unsigned char *section, int len) {
     if (len < 3) return;
@@ -451,7 +438,6 @@ void handle_section(ScanContext *ctx, int pid, unsigned char *section, int len) 
     
     if (pid == 0x1FFB || is_eit_pid) {
         if (table_id == 0xC7) {
-            // MGT
             int tables_defined = (section[9] << 8) | section[10];
             int loop_offset = 11;
             for(int i=0; i<tables_defined; i++) {
@@ -472,13 +458,9 @@ void handle_section(ScanContext *ctx, int pid, unsigned char *section, int len) 
                 loop_offset += 11 + desc_len;
             }
         }
-        if (table_id == 0xC8 || table_id == 0xC9) {
-            parse_atsc_vct(ctx, section, len);
-        } else if (table_id == 0xCB) {
-            parse_atsc_eit(ctx, section, len);
-        } else if (table_id == 0xCC) {
-            parse_atsc_ett(ctx, section, len);
-        }
+        if (table_id == 0xC8 || table_id == 0xC9) parse_atsc_vct(ctx, section, len);
+        else if (table_id == 0xCB) parse_atsc_eit(ctx, section, len);
+        else if (table_id == 0xCC) parse_atsc_ett(ctx, section, len);
     }
 }
 
@@ -562,10 +544,6 @@ int parse_ts_chunk(ScanContext *ctx, const unsigned char *buf, size_t len) {
     return packet_count;
 }
 
-// -----------------------------------------------------------------------------
-// ATSC Parsing Logic
-// -----------------------------------------------------------------------------
-
 void parse_atsc_vct(ScanContext *ctx, unsigned char *section, int len) {
     int num_channels = section[9];
     int offset = 10;
@@ -590,9 +568,6 @@ void parse_atsc_eit(ScanContext *ctx, unsigned char *section, int len) {
     int num_events = section[9];
     int offset = 10;
 
-    // Map source_id to channel using VCT data
-    // NOTE: In ATSC, EIT source_id is NOT the same as SERVICE_ID (program_number) 
-    // from channels.conf. The VCT maps source_id → virtual channel number.
     char vct_chan[16];
     if (!get_source_map(ctx->freq, source_id, vct_chan, sizeof(vct_chan))) return;
     
@@ -600,9 +575,6 @@ void parse_atsc_eit(ScanContext *ctx, unsigned char *section, int len) {
     if (!ch) return;
     
     const char *chan_num = ch->number;
-
-    // Start transaction for batch processing
-    db_begin_transaction();
 
     for (int i = 0; i < num_events; i++) {
         if (offset + 10 > len) break;
@@ -626,16 +598,22 @@ void parse_atsc_eit(ScanContext *ctx, unsigned char *section, int len) {
         }
 
         char title[256] = {0};
-        if (title_len > 0) {
-            int str_offset = offset + 10;
-            if (str_offset + title_len <= len) {
-                atsc_mss_to_string(section + str_offset, title_len, title, sizeof(title));
-            }
+        if (title_len > 0 && offset + 10 + title_len <= len) {
+            atsc_mss_to_string(section + offset + 10, title_len, title, sizeof(title));
         }
 
         if (title[0] != '\0' && start_ms > 0) {
-            db_upsert_program(ctx->freq, chan_num, start_ms, end_ms, title, event_id, source_id);
-            ctx->programs_found++;
+            Program p = {0};
+            strncpy(p.frequency, ctx->freq, sizeof(p.frequency)-1);
+            strncpy(p.channel_service_id, chan_num, sizeof(p.channel_service_id)-1);
+            p.start_time = start_ms;
+            p.end_time = end_ms;
+            strncpy(p.title, title, sizeof(p.title)-1);
+            p.event_id = event_id;
+            p.source_id = source_id;
+            p.description[0] = '\0';
+            
+            ctx_upsert(ctx, &p);
         }
 
         int after_title = offset + 10 + title_len;
@@ -644,20 +622,13 @@ void parse_atsc_eit(ScanContext *ctx, unsigned char *section, int len) {
             offset = after_title + 2 + desc_len;
         } else break;
     }
-    
-    db_commit_transaction();
 }
 
 void parse_atsc_ett(ScanContext *ctx, unsigned char *section, int len) {
     if (len < 17) return;
-    int source_id_from_header = (section[3] << 8) | section[4];
+    // int source_id = (section[3] << 8) | section[4];
     unsigned int etm_id = (section[9] << 24) | (section[10] << 16) | (section[11] << 8) | section[12];
     int event_id = (etm_id >> 2) & 0x3FFF;
-    
-    // Map source_id to channel using VCT data
-    // NOTE: In ATSC, ETT source_id is NOT the same as SERVICE_ID (program_number)
-    char chan_num[16];
-    if (!get_source_map(ctx->freq, source_id_from_header, chan_num, sizeof(chan_num))) return;
     
     int section_length = ((section[1] & 0x0F) << 8) | section[2];
     int mss_start = 13;
@@ -668,14 +639,13 @@ void parse_atsc_ett(ScanContext *ctx, unsigned char *section, int len) {
     char desc[1024] = {0};
     atsc_mss_to_string(section + mss_start, mss_len, desc, sizeof(desc));
     
-    if (desc[0] != '\0') db_update_program_description(ctx->freq, chan_num, event_id, desc);
+    if (desc[0] != '\0') ctx_update_description(ctx, event_id, desc);
 }
 
 void scan_mux(Tuner *t, ScanContext *ctx, const char *channel_number, const char *channel_name) {
     int pipefd[2];
     if (pipe(pipefd) == -1) return;
     
-    // Log with both for clarity, but zap with number
     LOG_INFO("EPG", "Scanning Mux %s (%s %s) on Tuner %d", ctx->freq, channel_name, channel_number, t->id);
 
     pid_t pid = fork();
@@ -684,7 +654,6 @@ void scan_mux(Tuner *t, ScanContext *ctx, const char *channel_number, const char
         dup2(pipefd[1], STDOUT_FILENO);
         close(pipefd[1]);
         
-        // Suppress stderr unless verbose mode is enabled
         if (!g_verbose) {
             int devnull = open("/dev/null", O_WRONLY);
             if (devnull >= 0) {
@@ -714,19 +683,20 @@ void scan_mux(Tuner *t, ScanContext *ctx, const char *channel_number, const char
             if (leftover > 0) memmove(buf, buf + bytes_to_process, leftover);
         }
 
-        LOG_INFO("EPG", "Scan complete for %s %s: Found %d programs", channel_name, channel_number, ctx->programs_found);
+        // Bulk upsert collected programs
+        if (ctx->list.count > 0) {
+            LOG_INFO("EPG", "Scan complete for %s %s: Upserting %d programs (batched)", channel_name, channel_number, ctx->list.count);
+            db_bulk_upsert(&ctx->list);
+        } else {
+            LOG_INFO("EPG", "Scan complete for %s %s: No (new) programs found", channel_name, channel_number);
+        }
 
-        // If read returned < 0 and errno is not 0, we might have been preempted.
-        // Actually, if release_tuner kills the process, read will return 0 or error.
-        // Let's check if the child exited or was signaled.
         int status;
         waitpid(pid, &status, 0);
         t->zap_pid = 0;
         
         if (WIFSIGNALED(status)) {
             LOG_DEBUG("EPG", "Scan of %s interrupted (likely preempted)", ctx->freq);
-            fflush(stdout);
-            // Re-enqueue
             enqueue_mux(ctx->freq, channel_name, channel_number);
         }
 

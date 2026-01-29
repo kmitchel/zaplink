@@ -363,37 +363,47 @@ void start_http_server(int port) {
                     free(ctx);
                 }
             } else {
-                // Read from client
+                // Read from client in loop for EPOLLET
                 client_context_t *ctx = (client_context_t *)events[i].data.ptr;
                 
-                ssize_t n = read(ctx->fd, ctx->buffer + ctx->total_read, sizeof(ctx->buffer) - 1 - ctx->total_read);
-                if (n <= 0) {
-                    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) continue;
-                    // Error or close
-                    close(ctx->fd);
-                    free(ctx);
-                    continue;
-                }
-                
-                ctx->total_read += n;
-                ctx->buffer[ctx->total_read] = '\0';
-                
-                if (strstr(ctx->buffer, "\r\n\r\n")) {
-                    // Full header received.
-                    // Remove from epoll to stop monitoring
-                    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, ctx->fd, NULL);
-                    
-                    // Dispatch to thread pool
-                    if (thread_pool_submit(pool, process_client_request, ctx) < 0) {
-                        LOG_WARN("HTTP", "Thread pool full, dropping request");
-                        send_response(ctx->fd, "503 Service Unavailable", "text/plain", "Server busy");
+                while (1) {
+                    ssize_t n = read(ctx->fd, ctx->buffer + ctx->total_read, sizeof(ctx->buffer) - 1 - ctx->total_read);
+                    if (n < 0) {
+                        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                            break; // Drained
+                        }
+                        // Error
                         close(ctx->fd);
                         free(ctx);
+                        break;
+                    } else if (n == 0) {
+                        // EOF
+                        close(ctx->fd);
+                        free(ctx);
+                        break;
                     }
-                } else if (ctx->total_read >= sizeof(ctx->buffer) - 1) {
-                    send_response(ctx->fd, "431 Request Header Fields Too Large", "text/plain", "Too large");
-                    close(ctx->fd);
-                    free(ctx);
+
+                    ctx->total_read += n;
+                    ctx->buffer[ctx->total_read] = '\0';
+
+                    if (strstr(ctx->buffer, "\r\n\r\n")) {
+                        // Full header receive
+                        epoll_ctl(epoll_fd, EPOLL_CTL_DEL, ctx->fd, NULL);
+                        if (thread_pool_submit(pool, process_client_request, ctx) < 0) {
+                            LOG_WARN("HTTP", "Thread pool full, dropping request");
+                            send_response(ctx->fd, "503 Service Unavailable", "text/plain", "Server busy");
+                            close(ctx->fd);
+                            free(ctx);
+                        }
+                        break; // Request dispatched
+                    } 
+                    
+                    if (ctx->total_read >= sizeof(ctx->buffer) - 1) {
+                        send_response(ctx->fd, "431 Request Header Fields Too Large", "text/plain", "Too large");
+                        close(ctx->fd);
+                        free(ctx);
+                        break;
+                    }
                 }
             }
         }

@@ -54,9 +54,31 @@ void db_update_program_description(const char *frequency,
  * Delete program entries that ended more than 24 hours ago
  * @return Number of entries deleted
  */
+// Delete expired programs
 int db_cleanup_expired();
 
-// Transaction control for batching updates
+typedef struct {
+    char frequency[32];
+    char channel_service_id[32];
+    long long start_time;
+    long long end_time;
+    char title[256];
+    char description[1024];
+    int event_id;
+    int source_id;
+} Program;
+
+typedef struct {
+    Program *programs;
+    int count;
+    int capacity;
+} ProgramList;
+
+// Batch operations
+void db_bulk_upsert(ProgramList *list);
+void db_invalidate_cache();
+
+// Transaction control (still useful for manual batches if needed)
 void db_begin_transaction();
 void db_commit_transaction();
 

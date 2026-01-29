@@ -34,17 +34,18 @@ static sqlite3_stmt *stmt_upsert = NULL;
 static sqlite3_stmt *stmt_update_desc = NULL;
 static pthread_mutex_t db_stmt_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+/* XMLTV Cache */
+static char *g_xmltv_cache = NULL;
+static char *g_json_cache = NULL;
+static time_t g_last_update_time = 0;
+static pthread_mutex_t g_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 int db_init() {
     int rc = sqlite3_open(DB_PATH, &db);
     if (rc) {
         fprintf(stderr, "Can't open database: %s\n", sqlite3_errmsg(db));
         return 0;
     }
-    
-    // Check constraints are off by default in some older sqlites, ensure foreign keys are on if needed (not needed yet)
-    // Synchronous = NORMAL is safer than OFF but faster than FULL. 
-    // WAL mode usually better but requires /dev/shm which might be restricted in some containers.
-    // Stick to default pending performance profile.
     
     // Create Table if not exists
     char *sql = "CREATE TABLE IF NOT EXISTS programs ("
@@ -82,6 +83,11 @@ void db_close() {
     if (stmt_upsert) { sqlite3_finalize(stmt_upsert); stmt_upsert = NULL; }
     if (stmt_update_desc) { sqlite3_finalize(stmt_update_desc); stmt_update_desc = NULL; }
     pthread_mutex_unlock(&db_stmt_mutex);
+
+    pthread_mutex_lock(&g_cache_mutex);
+    if (g_xmltv_cache) { free(g_xmltv_cache); g_xmltv_cache = NULL; }
+    if (g_json_cache) { free(g_json_cache); g_json_cache = NULL; }
+    pthread_mutex_unlock(&g_cache_mutex);
 
     if (db) sqlite3_close(db);
 }
@@ -121,12 +127,17 @@ int db_has_data() {
     return has_data;
 }
 
+void db_invalidate_cache() {
+    pthread_mutex_lock(&g_cache_mutex);
+    g_last_update_time = 0; // Force regeneration
+    pthread_mutex_unlock(&g_cache_mutex);
+}
+
 // Helper to append to dynamic string. Returns 1 on success, 0 on OOM.
 int append_str(char **dest, size_t *size, size_t *cap, const char *src) {
     size_t len = strlen(src);
     if (*size + len + 1 > *cap) {
         size_t new_cap = (*size + len + 1) * 2;
-        // Sometimes a large jump is better if we are growing huge
         if (new_cap < *cap + 1024*1024) new_cap = *cap + 1024*1024; 
         
         char *new_dest = realloc(*dest, new_cap);
@@ -163,12 +174,21 @@ static int xml_escape_append(char **dest, size_t *size, size_t *cap, const char 
 char *db_get_xmltv_programs() {
     if (!db) return NULL;
 
-    // Optimization: Get count first to pre-size buffer
-    int row_count = 0;
+    pthread_mutex_lock(&g_cache_mutex);
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     long long now_ms = (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
     
+    // Return cache if valid (less than 5 mins old and not invalidated)
+    if (g_xmltv_cache && (time(NULL) - g_last_update_time < 300)) {
+        char *copy = strdup(g_xmltv_cache);
+        pthread_mutex_unlock(&g_cache_mutex);
+        return copy;
+    }
+    pthread_mutex_unlock(&g_cache_mutex);
+
+    // Regenerate
+    int row_count = 0;
     // Pre-count query
     sqlite3_stmt *count_stmt;
     if (sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM programs WHERE end_time > ?", -1, &count_stmt, NULL) == SQLITE_OK) {
@@ -179,8 +199,6 @@ char *db_get_xmltv_programs() {
         sqlite3_finalize(count_stmt);
     }
     
-    // Estimate size: ~600 bytes per program entry + header/footer
-    // If 0 rows, use default small cap
     size_t cap = (row_count > 0) ? (row_count * 600 + 4096) : (64 * 1024);
     size_t size = 0;
     char *xml = malloc(cap);
@@ -272,6 +290,14 @@ char *db_get_xmltv_programs() {
     APPEND_OR_FAIL(append_str(&xml, &size, &cap, "</tv>"));
     
     sqlite3_finalize(stmt);
+
+    // Update Cache
+    pthread_mutex_lock(&g_cache_mutex);
+    if (g_xmltv_cache) free(g_xmltv_cache);
+    g_xmltv_cache = strdup(xml);
+    g_last_update_time = time(NULL);
+    pthread_mutex_unlock(&g_cache_mutex);
+
     return xml;
 
 oom_fail:
@@ -310,6 +336,8 @@ static int json_escape_append(char **dest, size_t *size, size_t *cap, const char
 
 char *db_get_json_programs() {
     if (!db) return NULL;
+    
+    // (Optional: Implement JSON caching here too if needed, but skipped for now as per plan/task)
 
     const char *sql = "SELECT title, description, start_time, end_time, channel_service_id FROM programs "
                 "WHERE end_time > ? "
@@ -383,14 +411,66 @@ oom_fail:
     return NULL;
 }
 
+// Bulk Upsert Implementation
+void db_bulk_upsert(ProgramList *list) {
+    if (!db || !list || !list->programs || list->count == 0) return;
+
+    db_begin_transaction();
+    
+    pthread_mutex_lock(&db_stmt_mutex);
+    
+    // Prepare statement if needed
+    if (!stmt_upsert) {
+        char *sql = "INSERT INTO programs (frequency, channel_service_id, start_time, end_time, title, description, event_id, source_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(frequency, channel_service_id, start_time) "
+                    "DO UPDATE SET title=excluded.title, end_time=excluded.end_time, event_id=excluded.event_id, source_id=excluded.source_id";
+        
+        if (sqlite3_prepare_v2(db, sql, -1, &stmt_upsert, 0) != SQLITE_OK) {
+            LOG_ERROR("DB", "Failed to prepare upsert stmt: %s", sqlite3_errmsg(db));
+            pthread_mutex_unlock(&db_stmt_mutex);
+            db_commit_transaction();
+            return;
+        }
+    }
+
+    for (int i = 0; i < list->count; i++) {
+        Program *p = &list->programs[i];
+        
+        sqlite3_bind_text(stmt_upsert, 1, p->frequency, -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt_upsert, 2, p->channel_service_id, -1, SQLITE_STATIC);
+        sqlite3_bind_int64(stmt_upsert, 3, p->start_time);
+        sqlite3_bind_int64(stmt_upsert, 4, p->end_time);
+        sqlite3_bind_text(stmt_upsert, 5, p->title, -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt_upsert, 6, p->description, -1, SQLITE_STATIC);
+        sqlite3_bind_int(stmt_upsert, 7, p->event_id);
+        sqlite3_bind_int(stmt_upsert, 8, p->source_id);
+
+        if (sqlite3_step(stmt_upsert) != SQLITE_DONE) {
+             LOG_ERROR("DB", "Upsert step failed: %s", sqlite3_errmsg(db));
+        }
+        
+        sqlite3_reset(stmt_upsert);
+        sqlite3_clear_bindings(stmt_upsert);
+    }
+    
+    pthread_mutex_unlock(&db_stmt_mutex);
+    db_commit_transaction();
+    
+    // Invalidate cache after update
+    db_invalidate_cache();
+}
 
 void db_upsert_program(const char *frequency, const char *channel_service_id, long long start_time, long long end_time, const char *title, int event_id, int source_id) {
+    // Wrapper for single upsert (if needed) by creating list of 1
+    // But usually called directly for single purpose?
+    // Let's keep implementation valid but also invalidate cache
     if (!db) return;
 
     pthread_mutex_lock(&db_stmt_mutex);
     
     if (!stmt_upsert) {
-        char *sql = "INSERT INTO programs (frequency, channel_service_id, start_time, end_time, title, description, event_id, source_id) "
+         char *sql = "INSERT INTO programs (frequency, channel_service_id, start_time, end_time, title, description, event_id, source_id) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
                     "ON CONFLICT(frequency, channel_service_id, start_time) "
                     "DO UPDATE SET title=excluded.title, end_time=excluded.end_time, event_id=excluded.event_id, source_id=excluded.source_id";
@@ -401,30 +481,22 @@ void db_upsert_program(const char *frequency, const char *channel_service_id, lo
             return;
         }
     }
-
-    // Reset before bind (in case previous exec failed or normal reuse)
-    // Actually sqlite3_reset should be called after step, but safe to call here if needed?
-    // Standard pattern is: bind, step, reset.
-    // If we crash mid-step, the statement might remain busy.
-    // But we are in a mutex.
     
     sqlite3_bind_text(stmt_upsert, 1, frequency, -1, SQLITE_STATIC);
     sqlite3_bind_text(stmt_upsert, 2, channel_service_id, -1, SQLITE_STATIC);
     sqlite3_bind_int64(stmt_upsert, 3, start_time);
     sqlite3_bind_int64(stmt_upsert, 4, end_time);
     sqlite3_bind_text(stmt_upsert, 5, title, -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt_upsert, 6, "", -1, SQLITE_STATIC); // Description empty for now
+    sqlite3_bind_text(stmt_upsert, 6, "", -1, SQLITE_STATIC); 
     sqlite3_bind_int(stmt_upsert, 7, event_id);
     sqlite3_bind_int(stmt_upsert, 8, source_id);
 
-    if (sqlite3_step(stmt_upsert) != SQLITE_DONE) {
-         LOG_ERROR("DB", "Upsert step failed: %s", sqlite3_errmsg(db));
-    }
-    
+    sqlite3_step(stmt_upsert);
     sqlite3_reset(stmt_upsert);
     sqlite3_clear_bindings(stmt_upsert);
     
     pthread_mutex_unlock(&db_stmt_mutex);
+    db_invalidate_cache();
 }
 
 void db_update_program_description(const char *frequency, const char *channel_service_id, int event_id, const char *description) {
@@ -446,14 +518,12 @@ void db_update_program_description(const char *frequency, const char *channel_se
     sqlite3_bind_text(stmt_update_desc, 3, channel_service_id, -1, SQLITE_STATIC);
     sqlite3_bind_int(stmt_update_desc, 4, event_id);
 
-    if (sqlite3_step(stmt_update_desc) != SQLITE_DONE) {
-        LOG_ERROR("DB", "Update desc step failed: %s", sqlite3_errmsg(db));
-    }
-
+    sqlite3_step(stmt_update_desc);
     sqlite3_reset(stmt_update_desc);
     sqlite3_clear_bindings(stmt_update_desc);
 
     pthread_mutex_unlock(&db_stmt_mutex);
+    db_invalidate_cache();
 }
 
 // Delete program entries that ended more than 24 hours ago
@@ -481,6 +551,7 @@ int db_cleanup_expired() {
 
     if (deleted > 0) {
         printf("[DB] Cleaned up %d expired program entries\n", deleted);
+        db_invalidate_cache();
     }
     return deleted;
 }
