@@ -601,6 +601,9 @@ void parse_atsc_eit(ScanContext *ctx, unsigned char *section, int len) {
     
     const char *chan_num = ch->number;
 
+    // Start transaction for batch processing
+    db_begin_transaction();
+
     for (int i = 0; i < num_events; i++) {
         if (offset + 10 > len) break;
         int event_id = ((section[offset] & 0x3F) << 8) | section[offset + 1];
@@ -641,6 +644,8 @@ void parse_atsc_eit(ScanContext *ctx, unsigned char *section, int len) {
             offset = after_title + 2 + desc_len;
         } else break;
     }
+    
+    db_commit_transaction();
 }
 
 void parse_atsc_ett(ScanContext *ctx, unsigned char *section, int len) {

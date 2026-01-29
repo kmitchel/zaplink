@@ -56,4 +56,8 @@ void db_update_program_description(const char *frequency,
  */
 int db_cleanup_expired();
 
+// Transaction control for batching updates
+void db_begin_transaction();
+void db_commit_transaction();
+
 #endif /* DB_H */
