@@ -69,20 +69,20 @@ static int write_all(int fd, const char *buf, size_t len) {
     return 1;
 }
 
-// Helper to append args to argv with safety check
-// Helper to append args to argv with overflow tracking
-static int add_arg(char **argv, int *argc, const char *arg) {
+// Helper to append args to argv with sticky error handling
+static void add_arg(char **argv, int *argc, const char *arg, int *err) {
+    if (*err) return; // Propagate error (sticky)
+
     if (*argc < 127) {
         argv[*argc] = (char *)arg;
         argv[*argc + 1] = NULL;
         (*argc)++;
-        return 0;
+        return;
     }
     
     // Overflow detected
     LOG_ERROR("TRANSCODE", "Argv limit exceeded (128), dropping argument: %s", arg);
-    (*argc)++; // Increment to track total needed size
-    return -1;
+    *err = 1;
 }
 
 void handle_unified_stream(int sockfd, StreamConfig *config, const char *http_header) {
@@ -192,18 +192,19 @@ void handle_unified_stream(int sockfd, StreamConfig *config, const char *http_he
             // Construct argv for execvp directly
             char *args[128];
             int n = 0;
+            int err = 0; // Sticky error flag
             
-            add_arg(args, &n, "ffmpeg");
+            add_arg(args, &n, "ffmpeg", &err);
             
             // Input options (common)
-            add_arg(args, &n, "-fflags"); add_arg(args, &n, "+genpts+discardcorrupt");
-            add_arg(args, &n, "-analyzeduration"); add_arg(args, &n, "1000000");
-            add_arg(args, &n, "-probesize"); add_arg(args, &n, "5000000");
-            add_arg(args, &n, "-thread_queue_size"); add_arg(args, &n, "512");
+            add_arg(args, &n, "-fflags", &err); add_arg(args, &n, "+genpts+discardcorrupt", &err);
+            add_arg(args, &n, "-analyzeduration", &err); add_arg(args, &n, "1000000", &err);
+            add_arg(args, &n, "-probesize", &err); add_arg(args, &n, "5000000", &err);
+            add_arg(args, &n, "-thread_queue_size", &err); add_arg(args, &n, "512", &err);
             
             // Input file (stdin)
-            add_arg(args, &n, "-f"); add_arg(args, &n, "mpegts");
-            add_arg(args, &n, "-i"); add_arg(args, &n, "-");
+            add_arg(args, &n, "-f", &err); add_arg(args, &n, "mpegts", &err);
+            add_arg(args, &n, "-i", &err); add_arg(args, &n, "-", &err);
             
             // Codec Configuration
             char ac_str[8]; // Buffer for audio channels
@@ -211,13 +212,13 @@ void handle_unified_stream(int sockfd, StreamConfig *config, const char *http_he
             
             if (config->codec == CODEC_COPY) {
                 // Passthrough Mode
-                add_arg(args, &n, "-c"); add_arg(args, &n, "copy");
+                add_arg(args, &n, "-c", &err); add_arg(args, &n, "copy", &err);
                 
                 // Muxer flags for clean TS output
-                add_arg(args, &n, "-f"); add_arg(args, &n, "mpegts");
-                add_arg(args, &n, "-mpegts_flags"); add_arg(args, &n, "+resend_headers");
-                add_arg(args, &n, "-pat_period"); add_arg(args, &n, "0.1");
-                add_arg(args, &n, "-sdt_period"); add_arg(args, &n, "0.5");
+                add_arg(args, &n, "-f", &err); add_arg(args, &n, "mpegts", &err);
+                add_arg(args, &n, "-mpegts_flags", &err); add_arg(args, &n, "+resend_headers", &err);
+                add_arg(args, &n, "-pat_period", &err); add_arg(args, &n, "0.1", &err);
+                add_arg(args, &n, "-sdt_period", &err); add_arg(args, &n, "0.5", &err);
                 
             } else {
                 // Transcoding Mode
@@ -225,76 +226,76 @@ void handle_unified_stream(int sockfd, StreamConfig *config, const char *http_he
                 // Hardware Acceleration Flags
                 switch (config->backend) {
                     case BACKEND_QSV:
-                        add_arg(args, &n, "-hwaccel"); add_arg(args, &n, "qsv");
-                        add_arg(args, &n, "-hwaccel_output_format"); add_arg(args, &n, "qsv");
-                        add_arg(args, &n, "-init_hw_device"); add_arg(args, &n, "qsv=qsv:hw");
-                        add_arg(args, &n, "-filter_hw_device"); add_arg(args, &n, "qsv");
+                        add_arg(args, &n, "-hwaccel", &err); add_arg(args, &n, "qsv", &err);
+                        add_arg(args, &n, "-hwaccel_output_format", &err); add_arg(args, &n, "qsv", &err);
+                        add_arg(args, &n, "-init_hw_device", &err); add_arg(args, &n, "qsv=qsv:hw", &err);
+                        add_arg(args, &n, "-filter_hw_device", &err); add_arg(args, &n, "qsv", &err);
                         break;
                     case BACKEND_NVENC:
-                        add_arg(args, &n, "-hwaccel"); add_arg(args, &n, "cuda");
-                        add_arg(args, &n, "-hwaccel_output_format"); add_arg(args, &n, "cuda");
+                        add_arg(args, &n, "-hwaccel", &err); add_arg(args, &n, "cuda", &err);
+                        add_arg(args, &n, "-hwaccel_output_format", &err); add_arg(args, &n, "cuda", &err);
                         break;
                     case BACKEND_VAAPI:
-                        add_arg(args, &n, "-hwaccel"); add_arg(args, &n, "vaapi");
-                        add_arg(args, &n, "-hwaccel_output_format"); add_arg(args, &n, "vaapi");
-                        add_arg(args, &n, "-hwaccel_device"); add_arg(args, &n, "/dev/dri/renderD128");
+                        add_arg(args, &n, "-hwaccel", &err); add_arg(args, &n, "vaapi", &err);
+                        add_arg(args, &n, "-hwaccel_output_format", &err); add_arg(args, &n, "vaapi", &err);
+                        add_arg(args, &n, "-hwaccel_device", &err); add_arg(args, &n, "/dev/dri/renderD128", &err);
                         break;
                     default: break;
                 }
                 
                 // Video Filters
-                add_arg(args, &n, "-vf");
+                add_arg(args, &n, "-vf", &err);
                 switch (config->backend) {
-                    case BACKEND_QSV: add_arg(args, &n, "vpp_qsv=deinterlace=2"); break;
-                    case BACKEND_NVENC: add_arg(args, &n, "yadif_cuda"); break;
-                    case BACKEND_VAAPI: add_arg(args, &n, "deinterlace_vaapi"); break;
-                    default: add_arg(args, &n, "yadif,format=yuv420p"); break;
+                    case BACKEND_QSV: add_arg(args, &n, "vpp_qsv=deinterlace=2", &err); break;
+                    case BACKEND_NVENC: add_arg(args, &n, "yadif_cuda", &err); break;
+                    case BACKEND_VAAPI: add_arg(args, &n, "deinterlace_vaapi", &err); break;
+                    default: add_arg(args, &n, "yadif,format=yuv420p", &err); break;
                 }
                 
                 // Video Encoder & Options
-                add_arg(args, &n, "-c:v");
+                add_arg(args, &n, "-c:v", &err);
                 
                 if (config->backend == BACKEND_QSV) {
                     if (config->codec == CODEC_H264) {
-                        add_arg(args, &n, "h264_qsv");
-                        add_arg(args, &n, "-look_ahead"); add_arg(args, &n, "0");
-                        add_arg(args, &n, "-async_depth"); add_arg(args, &n, "1");
+                        add_arg(args, &n, "h264_qsv", &err);
+                        add_arg(args, &n, "-look_ahead", &err); add_arg(args, &n, "0", &err);
+                        add_arg(args, &n, "-async_depth", &err); add_arg(args, &n, "1", &err);
                     } else if (config->codec == CODEC_HEVC) {
-                         add_arg(args, &n, "hevc_qsv");
-                         add_arg(args, &n, "-look_ahead"); add_arg(args, &n, "0");
-                         add_arg(args, &n, "-async_depth"); add_arg(args, &n, "1");
+                         add_arg(args, &n, "hevc_qsv", &err);
+                         add_arg(args, &n, "-look_ahead", &err); add_arg(args, &n, "0", &err);
+                         add_arg(args, &n, "-async_depth", &err); add_arg(args, &n, "1", &err);
                     } else if (config->codec == CODEC_AV1) {
-                         add_arg(args, &n, "av1_qsv");
-                         add_arg(args, &n, "-async_depth"); add_arg(args, &n, "1");
+                         add_arg(args, &n, "av1_qsv", &err);
+                         add_arg(args, &n, "-async_depth", &err); add_arg(args, &n, "1", &err);
                     }
                 } else if (config->backend == BACKEND_NVENC) {
-                    if (config->codec == CODEC_H264) add_arg(args, &n, "h264_nvenc");
-                    else if (config->codec == CODEC_HEVC) add_arg(args, &n, "hevc_nvenc");
-                    else if (config->codec == CODEC_AV1) add_arg(args, &n, "av1_nvenc");
+                    if (config->codec == CODEC_H264) add_arg(args, &n, "h264_nvenc", &err);
+                    else if (config->codec == CODEC_HEVC) add_arg(args, &n, "hevc_nvenc", &err);
+                    else if (config->codec == CODEC_AV1) add_arg(args, &n, "av1_nvenc", &err);
                     
-                    add_arg(args, &n, "-preset"); add_arg(args, &n, "p1");
-                    add_arg(args, &n, "-tune"); add_arg(args, &n, "ll");
+                    add_arg(args, &n, "-preset", &err); add_arg(args, &n, "p1", &err);
+                    add_arg(args, &n, "-tune", &err); add_arg(args, &n, "ll", &err);
                     if (config->codec != CODEC_AV1) { // AV1 nvenc might not support zerolatency flag in all versions
-                         add_arg(args, &n, "-zerolatency"); add_arg(args, &n, "1");
+                         add_arg(args, &n, "-zerolatency", &err); add_arg(args, &n, "1", &err);
                     }
                 } else if (config->backend == BACKEND_VAAPI) {
-                    if (config->codec == CODEC_H264) add_arg(args, &n, "h264_vaapi");
-                    else if (config->codec == CODEC_HEVC) add_arg(args, &n, "hevc_vaapi");
-                    else if (config->codec == CODEC_AV1) add_arg(args, &n, "av1_vaapi");
+                    if (config->codec == CODEC_H264) add_arg(args, &n, "h264_vaapi", &err);
+                    else if (config->codec == CODEC_HEVC) add_arg(args, &n, "hevc_vaapi", &err);
+                    else if (config->codec == CODEC_AV1) add_arg(args, &n, "av1_vaapi", &err);
                     if (config->codec != CODEC_AV1) {
-                        add_arg(args, &n, "-compression_level"); add_arg(args, &n, "0");
+                        add_arg(args, &n, "-compression_level", &err); add_arg(args, &n, "0", &err);
                     }
                 } else { // SOFTWARE
                     if (config->codec == CODEC_HEVC) {
-                        add_arg(args, &n, "libx265");
-                        add_arg(args, &n, "-preset"); add_arg(args, &n, "ultrafast");
+                        add_arg(args, &n, "libx265", &err);
+                        add_arg(args, &n, "-preset", &err); add_arg(args, &n, "ultrafast", &err);
                     } else if (config->codec == CODEC_AV1) {
-                        add_arg(args, &n, "libsvtav1");
-                        add_arg(args, &n, "-preset"); add_arg(args, &n, "12");
+                        add_arg(args, &n, "libsvtav1", &err);
+                        add_arg(args, &n, "-preset", &err); add_arg(args, &n, "12", &err);
                     } else {
-                        add_arg(args, &n, "libx264");
-                        add_arg(args, &n, "-preset"); add_arg(args, &n, "ultrafast");
-                        add_arg(args, &n, "-tune"); add_arg(args, &n, "zerolatency");
+                        add_arg(args, &n, "libx264", &err);
+                        add_arg(args, &n, "-preset", &err); add_arg(args, &n, "ultrafast", &err);
+                        add_arg(args, &n, "-tune", &err); add_arg(args, &n, "zerolatency", &err);
                     }
                 }
 
@@ -302,48 +303,47 @@ void handle_unified_stream(int sockfd, StreamConfig *config, const char *http_he
                 int rate = config->bitrate_kbps;
                 if (rate > 0) {
                      snprintf(bitrate_str, sizeof(bitrate_str), "%dk", rate);
-                     add_arg(args, &n, "-b:v"); add_arg(args, &n, bitrate_str);
+                     add_arg(args, &n, "-b:v", &err); add_arg(args, &n, bitrate_str, &err);
                      
                      if (config->backend != BACKEND_SOFTWARE || config->codec != CODEC_AV1) {
                          // SVT-AV1 has different RC params, simple copy logic skips -maxrate for it
                          char maxrate_str[16];
                          snprintf(maxrate_str, sizeof(maxrate_str), "%dk", rate * 2);
-                         add_arg(args, &n, "-maxrate"); add_arg(args, &n, maxrate_str);
+                         add_arg(args, &n, "-maxrate", &err); add_arg(args, &n, maxrate_str, &err);
                          
                          char bufsize_str[16];
                          snprintf(bufsize_str, sizeof(bufsize_str), "%dk", rate * 4);
-                         add_arg(args, &n, "-bufsize"); add_arg(args, &n, bufsize_str);
+                         add_arg(args, &n, "-bufsize", &err); add_arg(args, &n, bufsize_str, &err);
                      }
                 }
 
                 // GOP Size
-                add_arg(args, &n, "-g"); add_arg(args, &n, "60");
+                add_arg(args, &n, "-g", &err); add_arg(args, &n, "60", &err);
 
                 // Audio Codec
-                add_arg(args, &n, "-c:a"); add_arg(args, &n, "aac");
-                add_arg(args, &n, "-ac"); 
+                add_arg(args, &n, "-c:a", &err); add_arg(args, &n, "aac", &err);
+                add_arg(args, &n, "-ac", &err); 
                 snprintf(ac_str, sizeof(ac_str), "%d", config->audio_channels);
-                add_arg(args, &n, ac_str);
+                add_arg(args, &n, ac_str, &err);
                 
                 // Output Format
-                add_arg(args, &n, "-f");
+                add_arg(args, &n, "-f", &err);
                 if (config->backend == BACKEND_SOFTWARE && config->codec == CODEC_AV1) {
-                    add_arg(args, &n, "matroska");
+                    add_arg(args, &n, "matroska", &err);
                 } else {
-                    add_arg(args, &n, "mpegts");
-                    add_arg(args, &n, "-mpegts_flags"); add_arg(args, &n, "+resend_headers");
-                    add_arg(args, &n, "-pat_period"); add_arg(args, &n, "0.1");
-                    add_arg(args, &n, "-sdt_period"); add_arg(args, &n, "0.5");
+                    add_arg(args, &n, "mpegts", &err);
+                    add_arg(args, &n, "-mpegts_flags", &err); add_arg(args, &n, "+resend_headers", &err);
+                    add_arg(args, &n, "-pat_period", &err); add_arg(args, &n, "0.1", &err);
+                    add_arg(args, &n, "-sdt_period", &err); add_arg(args, &n, "0.5", &err);
                 }
             }
             
-            add_arg(args, &n, "-"); // Output to stdout
+            add_arg(args, &n, "-", &err); // Output to stdout
             args[n] = NULL;
             
-            // Check for argument overflow (n tracked total attempts)
-            // Capacity is 127 args + NULL. If n > 127, we dropped something.
-            if (n > 127) {
-                LOG_ERROR("TRANSCODE", "Argument overflow detected (%d > 127), aborting stream", n);
+            // Check for sticky error (overflow detected during build)
+            if (err) {
+                LOG_ERROR("TRANSCODE", "FFmpeg argument construction failed (overflow), aborting stream");
                 _exit(1);
             }
             
@@ -356,18 +356,7 @@ void handle_unified_stream(int sockfd, StreamConfig *config, const char *http_he
         close(zap_pipe[1]);
         close(pipefds[1]); // Close write end
         
-        //      forks zap
-        //      forks ffmpeg
-        //      exits? 
-        
-        // Wait, if the child exits, who reaps the zap/ffmpeg grandchildren? init?
-        // If we want "pid" (the one kill sent to) to represent the group, the child must stay alive using wait().
-        // BUT the parent reads from the pipe. If the child stays alive, does it interfere?
-        // No, the child just needs to NOT close the write end of pipefds if it wants to keep it open?
-        // Actually, ffmpeg has the write end. The Stream Monitor process (intermediate child) 
-        // doesn't need to hold the pipe.
-        // It can just wait() for its children.
-        
+        // Stream Monitor process
         close(pipefds[0]); // Monitor doesn't read
         
         // Wait for both children
