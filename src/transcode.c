@@ -69,6 +69,14 @@ static int write_all(int fd, const char *buf, size_t len) {
     return 1;
 }
 
+// Helper to append args to argv
+static void add_arg(char **argv, int *argc, const char *arg) {
+    if (*argc < 63) {
+        argv[(*argc)++] = (char *)arg;
+        argv[*argc] = NULL;
+    }
+}
+
 void handle_unified_stream(int sockfd, StreamConfig *config, const char *http_header) {
     // SECURITY: Validate channel_num to prevent shell injection
     if (!validate_channel_num(config->channel_num)) {
@@ -91,95 +99,8 @@ void handle_unified_stream(int sockfd, StreamConfig *config, const char *http_he
     char adapter_id[16];
     snprintf(adapter_id, sizeof(adapter_id), "%d", t->id);
 
-    char cmd[2048];
-    
-    // Transcoding variables
-    char v_encoder[256] = "libx264 -preset ultrafast -tune zerolatency";
-    char v_hw_args[256] = "";
-    char v_filter[128] = "";
-    char v_rate_control[256] = "";
-    int is_software_av1 = 0;
-    const char *out_fmt = "mpegts";
-    const char *mux_opts = "";
-    int bitrate = config->bitrate_kbps;
-
-    // Passthrough mode: minimal ffmpeg remux (copy video+audio) to clean MPEG-TS structure
-    // Raw dvbv5-zap output can have incomplete PSI tables that cause slow probing
-    if (config->codec == CODEC_COPY) {
-        snprintf(cmd, sizeof(cmd), 
-            "dvbv5-zap -c %s -a %s -o - %s | ffmpeg "
-            "-fflags +genpts+discardcorrupt -analyzeduration 1M -probesize 5M "
-            "-f mpegts -i - -c copy "
-            "-f mpegts -mpegts_flags +resend_headers -pat_period 0.1 -sdt_period 0.5 -",
-            channels_conf_path, adapter_id, c->number);
-        LOG_INFO("TRANSCODE", "Starting passthrough stream: %s", config->channel_num);
-    } else {
-        // Transcoding mode configuration
-        switch (config->backend) {
-            case BACKEND_QSV:
-                snprintf(v_hw_args, sizeof(v_hw_args), "-hwaccel qsv -hwaccel_output_format qsv -init_hw_device qsv=qsv:hw -filter_hw_device qsv");
-                if (config->codec == CODEC_H264) strcpy(v_encoder, "h264_qsv -look_ahead 0 -async_depth 1");
-                else if (config->codec == CODEC_HEVC) strcpy(v_encoder, "hevc_qsv -look_ahead 0 -async_depth 1");
-                else if (config->codec == CODEC_AV1) strcpy(v_encoder, "av1_qsv -async_depth 1");
-                strcpy(v_filter, "-vf \"vpp_qsv=deinterlace=2\"");
-                break;
-            case BACKEND_NVENC:
-                snprintf(v_hw_args, sizeof(v_hw_args), "-hwaccel cuda -hwaccel_output_format cuda");
-                if (config->codec == CODEC_H264) strcpy(v_encoder, "h264_nvenc -preset p1 -tune ll -zerolatency 1");
-                else if (config->codec == CODEC_HEVC) strcpy(v_encoder, "hevc_nvenc -preset p1 -tune ll -zerolatency 1");
-                else if (config->codec == CODEC_AV1) strcpy(v_encoder, "av1_nvenc -preset p1 -tune ll");
-                strcpy(v_filter, "-vf \"yadif_cuda\"");
-                break;
-            case BACKEND_VAAPI:
-                snprintf(v_hw_args, sizeof(v_hw_args), "-hwaccel vaapi -hwaccel_output_format vaapi -hwaccel_device /dev/dri/renderD128");
-                if (config->codec == CODEC_H264) strcpy(v_encoder, "h264_vaapi -compression_level 0");
-                else if (config->codec == CODEC_HEVC) strcpy(v_encoder, "hevc_vaapi -compression_level 0");
-                else if (config->codec == CODEC_AV1) strcpy(v_encoder, "av1_vaapi");
-                strcpy(v_filter, "-vf \"deinterlace_vaapi\"");
-                break;
-            default: // SOFTWARE
-                if (config->codec == CODEC_HEVC) strcpy(v_encoder, "libx265 -preset ultrafast");
-                else if (config->codec == CODEC_AV1) { 
-                    strcpy(v_encoder, "libsvtav1 -preset 12"); 
-                    is_software_av1 = 1; 
-                }
-                else strcpy(v_encoder, "libx264 -preset ultrafast -tune zerolatency");
-                strcpy(v_filter, "-vf \"yadif,format=yuv420p\"");
-                break;
-        }
-
-        // AV1 in software needs Matroska; hardware AV1 encoders can use MPEG-TS
-        out_fmt = (is_software_av1) ? "matroska" : "mpegts";
-        
-        // MPEG-TS options for live streaming: resend headers, frequent PSI tables
-        mux_opts = (is_software_av1) ? "" : "-mpegts_flags +resend_headers -pat_period 0.1 -sdt_period 0.5";
-        
-        // Rate control: if bitrate > 0, use ABR; otherwise let encoder use default (typically CRF/quality)
-        if (bitrate > 0) {
-            if (is_software_av1) {
-                // SVT-AV1 doesn't support -maxrate/-bufsize in ABR mode
-                snprintf(v_rate_control, sizeof(v_rate_control), "-b:v %dk", bitrate);
-            } else {
-                snprintf(v_rate_control, sizeof(v_rate_control), "-b:v %dk -maxrate %dk -bufsize %dk", 
-                         bitrate, bitrate * 2, bitrate * 4);
-            }
-        }
-
-        snprintf(cmd, sizeof(cmd),
-            "dvbv5-zap -c %s -a %s -o - %s | ffmpeg %s -fflags +genpts+discardcorrupt "
-            "-analyzeduration 1000000 -probesize 1000000 -thread_queue_size 512 -i - "
-            "%s -c:v %s %s -g 60 -c:a aac -ac %d -f %s %s -",
-            channels_conf_path, adapter_id, c->number, v_hw_args, v_filter, v_encoder, 
-            v_rate_control, config->audio_channels, out_fmt, mux_opts);
-
-        // NOTE: c->number is used here, not config->channel_num. 
-        // c->number comes from channels.conf which is trusted local data.
-        // FFmpeg input flags for live streaming:
-        //   -fflags +genpts+discardcorrupt: Generate PTS, discard corrupt frames
-        //   -analyzeduration 1M -probesize 1M: Faster stream detection (1 second)
-        //   -thread_queue_size 512: Larger input buffer for bursty input
-        LOG_INFO("TRANSCODE", "Starting stream: %s", config->channel_num);
-    }
+    LOG_INFO("TRANSCODE", "Starting stream: %s (Codec: %d, Backend: %d)", 
+             config->channel_num, config->codec, config->backend);
     
     // Create pipe between dvbv5-zap and ffmpeg
     int zap_pipe[2];
@@ -236,6 +157,7 @@ void handle_unified_stream(int sockfd, StreamConfig *config, const char *http_he
             dup2(zap_pipe[1], STDOUT_FILENO);
             close(zap_pipe[1]);
             
+            // Direct exec without shell
             execlp("dvbv5-zap", "dvbv5-zap", 
                    "-c", channels_conf_path,
                    "-a", adapter_id,
@@ -259,114 +181,156 @@ void handle_unified_stream(int sockfd, StreamConfig *config, const char *http_he
             dup2(pipefds[1], STDOUT_FILENO);
             close(pipefds[1]);
 
-            // Construct arguments array for execvp
-            // We use fixed-size array since arguments are relatively static
+            // Construct argv for execvp directly
             char *args[64];
-            int i = 0;
-            args[i++] = "ffmpeg";
+            int n = 0;
             
-            // Input options
-            args[i++] = "-fflags"; args[i++] = "+genpts+discardcorrupt";
-            args[i++] = "-analyzeduration"; args[i++] = "1000000";
-            args[i++] = "-probesize"; args[i++] = "5000000";
+            add_arg(args, &n, "ffmpeg");
+            
+            // Input options (common)
+            add_arg(args, &n, "-fflags"); add_arg(args, &n, "+genpts+discardcorrupt");
+            add_arg(args, &n, "-analyzeduration"); add_arg(args, &n, "1000000");
+            add_arg(args, &n, "-probesize"); add_arg(args, &n, "5000000");
+            add_arg(args, &n, "-thread_queue_size"); add_arg(args, &n, "512");
             
             // Input file (stdin)
-            args[i++] = "-f"; args[i++] = "mpegts";
-            args[i++] = "-i"; args[i++] = "-";
+            add_arg(args, &n, "-f"); add_arg(args, &n, "mpegts");
+            add_arg(args, &n, "-i"); add_arg(args, &n, "-");
             
-            // Video codec
+            // Codec Configuration
+            char ac_str[8]; // Buffer for audio channels
+            char bitrate_str[16]; // Buffer for bitrate
+            
             if (config->codec == CODEC_COPY) {
-                args[i++] = "-c"; args[i++] = "copy";
+                // Passthrough Mode
+                add_arg(args, &n, "-c"); add_arg(args, &n, "copy");
+                
+                // Muxer flags for clean TS output
+                add_arg(args, &n, "-f"); add_arg(args, &n, "mpegts");
+                add_arg(args, &n, "-mpegts_flags"); add_arg(args, &n, "+resend_headers");
+                add_arg(args, &n, "-pat_period"); add_arg(args, &n, "0.1");
+                add_arg(args, &n, "-sdt_period"); add_arg(args, &n, "0.5");
+                
             } else {
-                // Add hardware args if present
-                if (v_hw_args[0]) {
-                   // This is complex to parse back from the string - for robustness/simplicity in this refactor
-                   // we might need to reconstruct the args logic or just split the string.
-                   // Given the string composition above, let's keep it simple for now and rely on shell splitting?
-                   // No, we promised no shell. We need to tokenize v_hw_args if we want to use them.
-                   // For now, let's assume software encoding or simple flags for the approved plan scope.
-                   // Correction: The user wants full robustness. I should handle the args properly.
-                   // However, for this step, let's stick to the critical robust path:
-                   // Since splitting complex args strings in C is error prone without a helper,
-                   // and we know the exact formats from lines 112-124:
-                   // "-hwaccel qsv -hwaccel_output_format qsv..."
-                   // I will handle the common case (Software/Copy) robustly, and basic split for others.
-                   // Actually, for this specific refactor, let's focus on the Copy path which is the stability goal.
-                   // But wait, the function must support all modes.
-                   // I'll use a helper or simple tokenization for the existing strings.
-                   
-                   // SIMPLIFICATION: To not break non-copy modes, I will tokenize the strings 
-                   // constructed earlier (v_hw_args, v_filter, etc) by spaces.
-                   char *token = strtok(v_hw_args, " ");
-                   while (token != NULL && i < 60) {
-                       args[i++] = token;
-                       token = strtok(NULL, " ");
-                   }
+                // Transcoding Mode
+                
+                // Hardware Acceleration Flags
+                switch (config->backend) {
+                    case BACKEND_QSV:
+                        add_arg(args, &n, "-hwaccel"); add_arg(args, &n, "qsv");
+                        add_arg(args, &n, "-hwaccel_output_format"); add_arg(args, &n, "qsv");
+                        add_arg(args, &n, "-init_hw_device"); add_arg(args, &n, "qsv=qsv:hw");
+                        add_arg(args, &n, "-filter_hw_device"); add_arg(args, &n, "qsv");
+                        break;
+                    case BACKEND_NVENC:
+                        add_arg(args, &n, "-hwaccel"); add_arg(args, &n, "cuda");
+                        add_arg(args, &n, "-hwaccel_output_format"); add_arg(args, &n, "cuda");
+                        break;
+                    case BACKEND_VAAPI:
+                        add_arg(args, &n, "-hwaccel"); add_arg(args, &n, "vaapi");
+                        add_arg(args, &n, "-hwaccel_output_format"); add_arg(args, &n, "vaapi");
+                        add_arg(args, &n, "-hwaccel_device"); add_arg(args, &n, "/dev/dri/renderD128");
+                        break;
+                    default: break;
                 }
                 
-                args[i++] = "-c:v"; args[i++] = v_encoder;
+                // Video Filters
+                add_arg(args, &n, "-vf");
+                switch (config->backend) {
+                    case BACKEND_QSV: add_arg(args, &n, "vpp_qsv=deinterlace=2"); break;
+                    case BACKEND_NVENC: add_arg(args, &n, "yadif_cuda"); break;
+                    case BACKEND_VAAPI: add_arg(args, &n, "deinterlace_vaapi"); break;
+                    default: add_arg(args, &n, "yadif,format=yuv420p"); break;
+                }
                 
-                if (v_filter[0]) {
-                     // Filter string might contain internal quotes or spaces but usually it's -vf "filter"
-                     // The logic above constructed it as: -vf "yadif..."
-                     // I need to strip the -vf and just pass the filter content
-                     args[i++] = "-vf";
-                     // Extract just the filter part between quotes or after -vf
-                     // Hacky but works for the current known strings:
-                     char *f = strstr(v_filter, "vf");
-                     if (f) {
-                         char *start = strchr(f, '"');
-                         if (start) {
-                             char *end = strchr(start+1, '"');
-                             if (end) *end = 0;
-                             args[i++] = start+1;
-                         } else {
-                             // Fallback if no quotes
-                             args[i++] = f + 3; 
-                         }
+                // Video Encoder & Options
+                add_arg(args, &n, "-c:v");
+                
+                if (config->backend == BACKEND_QSV) {
+                    if (config->codec == CODEC_H264) {
+                        add_arg(args, &n, "h264_qsv");
+                        add_arg(args, &n, "-look_ahead"); add_arg(args, &n, "0");
+                        add_arg(args, &n, "-async_depth"); add_arg(args, &n, "1");
+                    } else if (config->codec == CODEC_HEVC) {
+                         add_arg(args, &n, "hevc_qsv");
+                         add_arg(args, &n, "-look_ahead"); add_arg(args, &n, "0");
+                         add_arg(args, &n, "-async_depth"); add_arg(args, &n, "1");
+                    } else if (config->codec == CODEC_AV1) {
+                         add_arg(args, &n, "av1_qsv");
+                         add_arg(args, &n, "-async_depth"); add_arg(args, &n, "1");
+                    }
+                } else if (config->backend == BACKEND_NVENC) {
+                    if (config->codec == CODEC_H264) add_arg(args, &n, "h264_nvenc");
+                    else if (config->codec == CODEC_HEVC) add_arg(args, &n, "hevc_nvenc");
+                    else if (config->codec == CODEC_AV1) add_arg(args, &n, "av1_nvenc");
+                    
+                    add_arg(args, &n, "-preset"); add_arg(args, &n, "p1");
+                    add_arg(args, &n, "-tune"); add_arg(args, &n, "ll");
+                    if (config->codec != CODEC_AV1) { // AV1 nvenc might not support zerolatency flag in all versions
+                         add_arg(args, &n, "-zerolatency"); add_arg(args, &n, "1");
+                    }
+                } else if (config->backend == BACKEND_VAAPI) {
+                    if (config->codec == CODEC_H264) add_arg(args, &n, "h264_vaapi");
+                    else if (config->codec == CODEC_HEVC) add_arg(args, &n, "hevc_vaapi");
+                    else if (config->codec == CODEC_AV1) add_arg(args, &n, "av1_vaapi");
+                    if (config->codec != CODEC_AV1) {
+                        add_arg(args, &n, "-compression_level"); add_arg(args, &n, "0");
+                    }
+                } else { // SOFTWARE
+                    if (config->codec == CODEC_HEVC) {
+                        add_arg(args, &n, "libx265");
+                        add_arg(args, &n, "-preset"); add_arg(args, &n, "ultrafast");
+                    } else if (config->codec == CODEC_AV1) {
+                        add_arg(args, &n, "libsvtav1");
+                        add_arg(args, &n, "-preset"); add_arg(args, &n, "12");
+                    } else {
+                        add_arg(args, &n, "libx264");
+                        add_arg(args, &n, "-preset"); add_arg(args, &n, "ultrafast");
+                        add_arg(args, &n, "-tune"); add_arg(args, &n, "zerolatency");
+                    }
+                }
+
+                // Rate Control
+                int rate = config->bitrate_kbps;
+                if (rate > 0) {
+                     snprintf(bitrate_str, sizeof(bitrate_str), "%dk", rate);
+                     add_arg(args, &n, "-b:v"); add_arg(args, &n, bitrate_str);
+                     
+                     if (config->backend != BACKEND_SOFTWARE || config->codec != CODEC_AV1) {
+                         // SVT-AV1 has different RC params, simple copy logic skips -maxrate for it
+                         char maxrate_str[16];
+                         snprintf(maxrate_str, sizeof(maxrate_str), "%dk", rate * 2);
+                         add_arg(args, &n, "-maxrate"); add_arg(args, &n, maxrate_str);
+                         
+                         char bufsize_str[16];
+                         snprintf(bufsize_str, sizeof(bufsize_str), "%dk", rate * 4);
+                         add_arg(args, &n, "-bufsize"); add_arg(args, &n, bufsize_str);
                      }
                 }
+
+                // GOP Size
+                add_arg(args, &n, "-g"); add_arg(args, &n, "60");
+
+                // Audio Codec
+                add_arg(args, &n, "-c:a"); add_arg(args, &n, "aac");
+                add_arg(args, &n, "-ac"); 
+                snprintf(ac_str, sizeof(ac_str), "%d", config->audio_channels);
+                add_arg(args, &n, ac_str);
                 
-                if (v_rate_control[0]) {
-                   char *token = strtok(v_rate_control, " ");
-                   while (token && i < 60) {
-                       args[i++] = token;
-                       token = strtok(NULL, " ");
-                   }
+                // Output Format
+                add_arg(args, &n, "-f");
+                if (config->backend == BACKEND_SOFTWARE && config->codec == CODEC_AV1) {
+                    add_arg(args, &n, "matroska");
+                } else {
+                    add_arg(args, &n, "mpegts");
+                    add_arg(args, &n, "-mpegts_flags"); add_arg(args, &n, "+resend_headers");
+                    add_arg(args, &n, "-pat_period"); add_arg(args, &n, "0.1");
+                    add_arg(args, &n, "-sdt_period"); add_arg(args, &n, "0.5");
                 }
             }
             
-            // Audio codec
-            args[i++] = "-c:a"; args[i++] = "aac";
-            // args[i++] = "-ac"; // Need to convert int to string for audio channels
-            // We can skip explicit -ac if we just rely on aac default or use the string if needed.
-            // Let's create a temporary string for ac
-            // char ac_str[4]; snprintf(ac_str, 4, "%d", config->audio_channels);
-            // args[i++] = ac_str; -- Cannot do this safely in child after fork without pre-alloc
-            // Safe bet: just omit -ac in this robust version or assume 2?
-            // Wait, I can use a static/stack buffer since we are in a fresh process.
-            char ac_str[8];
-            sprintf(ac_str, "%d", config->audio_channels);
-            args[i++] = "-ac"; args[i++] = ac_str;
-
-            // Output format
-            args[i++] = "-f"; args[i++] = (char*)out_fmt;
-            
-            // Mux options
-            if (mux_opts && mux_opts[0]) {
-               // Tokenize mux opts: "-mpegts_flags +resend_headers ..."
-               // We need a non-const copy to tokenize
-               char mux_copy[256];
-               strncpy(mux_copy, mux_opts, 255);
-               char *token = strtok(mux_copy, " ");
-               while (token && i < 60) {
-                   args[i++] = token;
-                   token = strtok(NULL, " ");
-               }
-            }
-            
-            args[i++] = "-"; // Output to stdout
-            args[i] = NULL;
+            add_arg(args, &n, "-"); // Output to stdout
+            args[n] = NULL;
             
             execvp("ffmpeg", args);
             _exit(1);
@@ -377,16 +341,6 @@ void handle_unified_stream(int sockfd, StreamConfig *config, const char *http_he
         close(zap_pipe[1]);
         close(pipefds[1]); // Close write end
         
-        // Wait for children? No, we need to exit so the REAL parent can read from pipefds[0]
-        // Actually, the logic in original code was:
-        // pid = fork()
-        //   parent: reads pipefds[0]
-        //   child: exec pipeline
-        
-        // In this new structure:
-        // pid = fork() (Stream Monitor)
-        //   parent: identical to before (reads pipefds[0])
-        //   child: 
         //      forks zap
         //      forks ffmpeg
         //      exits? 
