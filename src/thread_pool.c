@@ -141,7 +141,7 @@ int thread_pool_submit(thread_pool_t *pool, thread_func_t func, void *arg) {
     }
     
     // Increment count (tracking active jobs + queue)
-    pool->working_count++; 
+    // pool->working_count++;  <-- REMOVED: Managed by worker thread now to avoid double counting
     // In this simple implementation:
     // working_count tracks TOTAL (queued + running).
     // The previous implementation used working_count only for running threads?

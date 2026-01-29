@@ -75,6 +75,9 @@ int main(int argc, char *argv[]) {
         LOG_INFO("MAIN", "Loaded %d channels", loaded);
     }
     
+    // Build fast lookup map for XMLTV generation
+    build_channel_lookup();
+    
     discover_tuners();
     if (tuner_count == 0) {
         LOG_WARN("MAIN", "No tuners found - streaming will not be available");
