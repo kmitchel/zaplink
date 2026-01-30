@@ -142,7 +142,16 @@ void handle_unified_stream(int sockfd, StreamConfig *config, const char *http_he
     
     if (pid == 0) {
         // Child: Setup process group
-        setpgid(0, 0);
+        if (setpgid(0, 0) < 0) {
+             LOG_ERROR("TRANSCODE", "setpgid failed: %s", strerror(errno));
+             _exit(1);
+        }
+        
+        // IMPORTANT: Reset signal handlers inherited from parent!
+        // Otherwise, receiving SIGTERM (during kill(-pid)) will execute the 
+        // parent's handler which writes to the shutdown pipe, killing the server.
+        signal(SIGINT, SIG_DFL);
+        signal(SIGTERM, SIG_DFL);
         
         // Suppress stderr unless verbose mode is enabled
         if (!g_verbose) {
