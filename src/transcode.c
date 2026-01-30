@@ -107,8 +107,8 @@ void handle_unified_stream(int sockfd, StreamConfig *config, const char *http_he
     char adapter_id[16];
     snprintf(adapter_id, sizeof(adapter_id), "%d", t->id);
 
-    LOG_INFO("TRANSCODE", "Starting stream: %s (Codec: %d, Backend: %d)", 
-             config->channel_num, config->codec, config->backend);
+    LOG_INFO("TRANSCODE", "Starting stream: %s (Codec: %d, Backend: %d, Adapter: %s)", 
+             config->channel_num, config->codec, config->backend, adapter_id);
     
     // Create pipe between dvbv5-zap and ffmpeg
     int zap_pipe[2];
@@ -417,7 +417,15 @@ void handle_unified_stream(int sockfd, StreamConfig *config, const char *http_he
     while (1) {
         // Poll with 5 second timeout to periodically check socket health
         int ret = poll(fds, 2, 5000);
-        
+
+        if (ret == 0) {
+            // Timeout (5s)
+            LOG_WARN("TRANSCODE", "Stream Stall: No data received from tuner/ffmpeg for 5s");
+            // Check if process is still alive? 
+            // For now just warn, maybe client will disconnect.
+            continue;
+        }
+
         if (ret < 0) {
             if (errno == EINTR) continue;
             LOG_WARN("TRANSCODE", "poll() error: %s", strerror(errno));
