@@ -175,10 +175,13 @@ void handle_unified_stream(int sockfd, StreamConfig *config, const char *http_he
             close(zap_pipe[1]);
             
             // Direct exec without shell
+            // -p records only the selected service PIDs and adds PAT/PMT.
+            // Do not use -P here: all-PID mode makes FFmpeg select the first
+            // program on the multiplex instead of the requested subchannel.
             execlp("dvbv5-zap", "dvbv5-zap", 
                    "-c", channels_conf_path,
                    "-a", adapter_id,
-                   "-P", "-r",
+                   "-p",
                    "-o", "-",
                    c->number, NULL);
             _exit(1);

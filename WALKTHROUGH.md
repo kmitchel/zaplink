@@ -15,7 +15,7 @@ This document details the security and robustness improvements applied to the Za
 The pipeline `dvbv5-zap | ffmpeg` is now constructed using direct system calls:
 -   **`fork()` & `pipe()`**: Processes are spawned individually with manual pipe management.
 -   **`execvp()` / `execlp()`**: Binaries are executed directly, bypassing the shell.
--   **Transport Output**: `dvbv5-zap` runs with `-P -r -o -`, enabling all-PID record mode and writing the MPEG-TS transport to the pipeline. Tuning without `-r` does not produce stream data.
+-   **Transport Output**: `dvbv5-zap` runs with `-p -o -`. Lowercase `-p` selects the requested service PIDs, adds PAT/PMT, implies record mode, and writes MPEG-TS to the pipeline. Uppercase `-P` must not be used here because it emits every program on the multiplex and allows FFmpeg to select the first subchannel.
 
 ### Argument Safety Strategy
 To prevent command truncation or buffer overflows, a "sticky error" pattern is used for building the argument list:
@@ -44,7 +44,7 @@ To prevent command truncation or buffer overflows, a "sticky error" pattern is u
 -   Configuration replacement uses a temporary file, flushes it to disk, and atomically renames it over `channels.conf`.
 
 ## 3. Verification
--   **Passthrough Mode**: The production endpoint returned HTTP 200 and transferred MPEG-TS data using `dvbv5-zap -P -r` with FFmpeg stream copy.
+-   **Passthrough Mode**: The production endpoint returned HTTP 200 and transferred the requested service using `dvbv5-zap -p` with FFmpeg stream copy.
 -   **Transcoding**: Hardware acceleration (QSV/NVENC/VAAPI) arguments verified.
 -   **Process Tree**: Confirmed no `sh` processes in the hierarchy.
 -   **Startup Readiness**: Verified immediate discovery with two frontends and the bounded 30-second no-device timeout path.

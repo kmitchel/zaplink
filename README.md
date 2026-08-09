@@ -168,9 +168,10 @@ All parameters are optional and can be appended to stream URLs or the playlist U
 ### Streaming Modes
 
 **Passthrough Mode (Default)**
-When no `codec` is specified (or `codec=copy`), `dvbv5-zap` emits the complete
-MPEG-TS transport with its record and all-PID modes enabled. FFmpeg uses stream
-copy, so video and audio are not re-encoded. This provides:
+When no `codec` is specified (or `codec=copy`), `dvbv5-zap` records only the
+requested service's video and audio PIDs and adds PAT/PMT tables. This prevents
+another subchannel on the same RF multiplex from being selected accidentally.
+FFmpeg uses stream copy, so video and audio are not re-encoded. This provides:
 - Minimal CPU usage for video processing
 - Original video/audio quality preserved
 - Lowest possible latency
