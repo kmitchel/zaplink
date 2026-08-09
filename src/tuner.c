@@ -23,6 +23,7 @@
 #include <sys/wait.h>
 #include <pthread.h>
 #include <errno.h>
+#include <glob.h>
 #include "tuner.h"
 #include "config.h"
 #include "log.h"
@@ -35,9 +36,81 @@ int last_tuner_index = -1;  /* For round-robin selection */
 /* Mutex protecting all tuner state modifications */
 static pthread_mutex_t tuner_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+static int adapter_has_usable_frontend(const char *adapter_path) {
+    char pattern[1024];
+    glob_t matches;
+    int usable = 0;
+
+    if (snprintf(pattern, sizeof(pattern), "%s/frontend*", adapter_path) >=
+        (int)sizeof(pattern)) {
+        return 0;
+    }
+    if (glob(pattern, GLOB_NOSORT, NULL, &matches) != 0) return 0;
+
+    for (size_t i = 0; i < matches.gl_pathc; i++) {
+        if (access(matches.gl_pathv[i], R_OK | W_OK) == 0) {
+            usable = 1;
+            break;
+        }
+    }
+    globfree(&matches);
+    return usable;
+}
+
+static int count_usable_frontends(void) {
+    glob_t matches;
+    int count = 0;
+
+    if (glob("/dev/dvb/adapter*/frontend*", GLOB_NOSORT, NULL, &matches) != 0) {
+        return 0;
+    }
+
+    for (size_t i = 0; i < matches.gl_pathc; i++) {
+        if (access(matches.gl_pathv[i], R_OK | W_OK) == 0) {
+            count++;
+        }
+    }
+
+    globfree(&matches);
+    return count;
+}
+
+int wait_for_tuners(unsigned int timeout_seconds) {
+    const useconds_t poll_interval_us = 250000;
+    unsigned int waited_ms = 0;
+    int count = count_usable_frontends();
+
+    if (count > 0) {
+        LOG_INFO("TUNER", "%d usable DVB frontend%s ready", count,
+                 count == 1 ? "" : "s");
+        return count;
+    }
+
+    LOG_INFO("TUNER", "Waiting up to %u seconds for DVB frontends",
+             timeout_seconds);
+
+    while (waited_ms < timeout_seconds * 1000U) {
+        usleep(poll_interval_us);
+        waited_ms += poll_interval_us / 1000U;
+        count = count_usable_frontends();
+        if (count > 0) {
+            LOG_INFO("TUNER", "%d usable DVB frontend%s ready after %.2f seconds",
+                     count, count == 1 ? "" : "s", waited_ms / 1000.0);
+            return count;
+        }
+    }
+
+    LOG_WARN("TUNER", "Timed out after %u seconds waiting for DVB frontends",
+             timeout_seconds);
+    return 0;
+}
+
 void discover_tuners() {
     DIR *d;
     struct dirent *dir;
+    tuner_count = 0;
+    last_tuner_index = -1;
+
     d = opendir("/dev/dvb");
     if (!d) {
         LOG_WARN("TUNER", "/dev/dvb not found");
@@ -55,9 +128,12 @@ void discover_tuners() {
             }
             
             if (tuner_count < MAX_TUNERS) {
-                tuners[tuner_count].id = (int)id;
-                snprintf(tuners[tuner_count].path, sizeof(tuners[tuner_count].path), 
+                snprintf(tuners[tuner_count].path,
+                         sizeof(tuners[tuner_count].path),
                          "/dev/dvb/%s", dir->d_name);
+                if (!adapter_has_usable_frontend(tuners[tuner_count].path)) continue;
+
+                tuners[tuner_count].id = (int)id;
                 tuners[tuner_count].in_use = 0;
                 tuners[tuner_count].zap_pid = 0;
                 tuners[tuner_count].user_type = USER_NONE;

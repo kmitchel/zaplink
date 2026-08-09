@@ -12,6 +12,8 @@ ZapLink has been hardened for production environments:
 
 ## Features
 - **Automatic Channel Scan**: Parallel tuner scanning with RabbitEars zip-code hints and optional VHF skipping.
+- **Reliable Device Startup**: Waits up to 30 seconds for USB DVB frontends before scanning or serving streams.
+- **Weak-Signal Filtering**: Measures each scanned multiplex and comments out channels below 20 dB C/N unless explicitly retained.
 - **Robust EPG**: Background EPG collection with valid XMLTV output supporting Jellyfin Series Recording.
 - **Live Streaming**: Supports software and hardware transcoding (QSV, VAAPI, NVENC) via FFmpeg.
 - **Simple API**: HTTP endpoints for M3U playlists and XMLTV guide data.
@@ -158,6 +160,7 @@ mpv "http://falcon:18392/playlist.m3u?backend=qsv&codec=h264"
 ## Notes
 - **Series Recording**: The generated XMLTV includes special tags (`<episode-num>`, `<category>Series</category>`) to ensure Jellyfin recognizes recurring shows.
 - **VHF Skipping**: During scan, you can choose to skip VHF-LO/HI (RF 2-13) if you only have a UHF antenna.
+- **Weak Channels**: The scanner asks whether to retain multiplexes below 20 dB C/N. By default their complete configuration blocks are preserved as comments so they are visible for later review but unavailable to Jellyfin.
 
 ## License
 No license specified.

@@ -26,6 +26,12 @@
 /** Maximum number of channels that can be loaded */
 #define MAX_CHANNELS 200
 
+/** Maximum time to wait for a usable DVB frontend during startup */
+#define TUNER_WAIT_TIMEOUT_SECONDS 30
+
+/** Minimum ATSC carrier-to-noise ratio retained by the channel scanner */
+#define MIN_RELIABLE_CNR_DB 20.0
+
 /** Global verbose flag (defined in main.c) */
 extern int g_verbose;
 

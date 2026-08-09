@@ -40,6 +40,14 @@ extern Tuner tuners[16];
 extern int tuner_count;
 
 /**
+ * Wait for at least one readable and writable DVB frontend.
+ *
+ * @param timeout_seconds Maximum number of seconds to wait
+ * @return Number of usable frontends found, or 0 on timeout
+ */
+int wait_for_tuners(unsigned int timeout_seconds);
+
+/**
  * Discover available DVB tuners on the system
  * Scans /dev/dvb/ for adapter directories
  */

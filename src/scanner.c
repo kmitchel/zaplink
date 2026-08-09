@@ -10,9 +10,12 @@
 #include <fcntl.h>
 #include <errno.h>
 #include "scanner.h"
+#include "config.h"
 
 #define RABBIT_EARS_URL "https://www.rabbitears.info/search.php?request=zip_search&zipcode="
 #define MAX_ADAPTERS 16
+#define MAX_MULTIPLEXES 128
+#define MAX_SCAN_SECTIONS 512
 
 typedef struct {
     int id;
@@ -22,6 +25,272 @@ typedef struct {
     int buf_len;
     int overflow_warned; // Track if we've warned about overflow
 } ScanWorker;
+
+typedef struct {
+    char frequency[32];
+    char channel_name[128];
+    double signal_dbm;
+    double cnr_db;
+    int sample_count;
+    int has_lock;
+    int weak;
+} ScanMultiplex;
+
+static char *skip_space(char *text) {
+    while (*text && isspace((unsigned char)*text)) text++;
+    return text;
+}
+
+static void copy_value(char *dest, size_t dest_size, const char *value) {
+    while (*value && isspace((unsigned char)*value)) value++;
+    size_t length = strcspn(value, "\r\n");
+    while (length > 0 && isspace((unsigned char)value[length - 1])) length--;
+    if (length >= dest_size) length = dest_size - 1;
+    memcpy(dest, value, length);
+    dest[length] = '\0';
+}
+
+static int find_multiplex(ScanMultiplex multiplexes[], int count,
+                          const char *frequency) {
+    for (int i = 0; i < count; i++) {
+        if (strcmp(multiplexes[i].frequency, frequency) == 0) return i;
+    }
+    return -1;
+}
+
+static int load_scan_multiplexes(const char *config_path,
+                                 ScanMultiplex multiplexes[], int *mux_count,
+                                 int section_mux[], int *section_count) {
+    FILE *config = fopen(config_path, "r");
+    if (!config) return 0;
+
+    char line[512];
+    char current_name[128] = "";
+    int current_section = -1;
+    *mux_count = 0;
+    *section_count = 0;
+
+    while (fgets(line, sizeof(line), config)) {
+        char *trimmed = skip_space(line);
+        size_t length = strcspn(trimmed, "\r\n");
+
+        if (trimmed[0] == '[' && length > 2 && trimmed[length - 1] == ']') {
+            if (*section_count >= MAX_SCAN_SECTIONS) {
+                current_section = -1;
+                continue;
+            }
+            current_section = (*section_count)++;
+            section_mux[current_section] = -1;
+            size_t name_length = length - 2;
+            if (name_length >= sizeof(current_name)) name_length = sizeof(current_name) - 1;
+            memcpy(current_name, trimmed + 1, name_length);
+            current_name[name_length] = '\0';
+            continue;
+        }
+
+        if (current_section < 0 || strncmp(trimmed, "FREQUENCY", 9) != 0) continue;
+        char *equals = strchr(trimmed, '=');
+        if (!equals) continue;
+
+        char frequency[32];
+        copy_value(frequency, sizeof(frequency), equals + 1);
+        int mux = find_multiplex(multiplexes, *mux_count, frequency);
+        if (mux < 0 && *mux_count < MAX_MULTIPLEXES) {
+            mux = (*mux_count)++;
+            memset(&multiplexes[mux], 0, sizeof(multiplexes[mux]));
+            snprintf(multiplexes[mux].frequency,
+                     sizeof(multiplexes[mux].frequency), "%s", frequency);
+            snprintf(multiplexes[mux].channel_name,
+                     sizeof(multiplexes[mux].channel_name), "%s", current_name);
+        }
+        section_mux[current_section] = mux;
+    }
+
+    fclose(config);
+    return *mux_count;
+}
+
+static void parse_signal_sample(ScanMultiplex *multiplex, const char *line) {
+    if (!strstr(line, "Lock")) return;
+
+    const char *signal = strstr(line, "Signal=");
+    const char *cnr = strstr(line, "C/N=");
+    if (!signal || !cnr) return;
+
+    char *signal_end;
+    char *cnr_end;
+    double signal_value = strtod(signal + 7, &signal_end);
+    double cnr_value = strtod(cnr + 4, &cnr_end);
+    if (signal_end == signal + 7 || cnr_end == cnr + 4) return;
+
+    multiplex->signal_dbm += signal_value;
+    multiplex->cnr_db += cnr_value;
+    multiplex->sample_count++;
+    multiplex->has_lock = 1;
+}
+
+static int measure_multiplex(const char *config_path, int adapter,
+                             ScanMultiplex *multiplex) {
+    int pipefd[2];
+    if (pipe(pipefd) < 0) return 0;
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        close(pipefd[0]);
+        dup2(pipefd[1], STDOUT_FILENO);
+        dup2(pipefd[1], STDERR_FILENO);
+        close(pipefd[1]);
+
+        char adapter_arg[16];
+        snprintf(adapter_arg, sizeof(adapter_arg), "%d", adapter);
+        execlp("dvbv5-zap", "dvbv5-zap",
+               "-a", adapter_arg, "-c", config_path, "-x", "-v",
+               multiplex->channel_name, NULL);
+        _exit(127);
+    }
+
+    if (pid < 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return 0;
+    }
+
+    close(pipefd[1]);
+    FILE *output = fdopen(pipefd[0], "r");
+    if (output) {
+        char line[512];
+        while (fgets(line, sizeof(line), output)) {
+            parse_signal_sample(multiplex, line);
+        }
+        fclose(output);
+    } else {
+        close(pipefd[0]);
+    }
+
+    int status;
+    waitpid(pid, &status, 0);
+    if (multiplex->sample_count > 0) {
+        multiplex->signal_dbm /= multiplex->sample_count;
+        multiplex->cnr_db /= multiplex->sample_count;
+    }
+    multiplex->weak = !multiplex->has_lock ||
+                      multiplex->cnr_db < MIN_RELIABLE_CNR_DB;
+    return multiplex->has_lock;
+}
+
+static int comment_weak_sections(const char *config_path,
+                                 ScanMultiplex multiplexes[],
+                                 const int section_mux[], int section_count) {
+    char temp_path[1024];
+    if (snprintf(temp_path, sizeof(temp_path), "%s.tmp.XXXXXX", config_path) >=
+        (int)sizeof(temp_path)) {
+        return 0;
+    }
+
+    int temp_fd = mkstemp(temp_path);
+    if (temp_fd < 0) return 0;
+
+    struct stat original_stat;
+    if (stat(config_path, &original_stat) == 0) {
+        fchmod(temp_fd, original_stat.st_mode & 0777);
+    }
+
+    FILE *source = fopen(config_path, "r");
+    FILE *dest = fdopen(temp_fd, "w");
+    if (!source || !dest) {
+        if (source) fclose(source);
+        if (dest) fclose(dest); else close(temp_fd);
+        unlink(temp_path);
+        return 0;
+    }
+
+    char line[512];
+    int section = -1;
+    int disabled = 0;
+    while (fgets(line, sizeof(line), source)) {
+        char *trimmed = skip_space(line);
+        size_t length = strcspn(trimmed, "\r\n");
+        if (trimmed[0] == '[' && length > 2 && trimmed[length - 1] == ']') {
+            section++;
+            disabled = 0;
+            if (section < section_count && section_mux[section] >= 0) {
+                disabled = multiplexes[section_mux[section]].weak;
+                if (disabled) {
+                    ScanMultiplex *mux = &multiplexes[section_mux[section]];
+                    if (mux->has_lock) {
+                        fprintf(dest,
+                                "# ZapLink disabled weak multiplex: %.1f dBm, "
+                                "%.1f dB C/N (minimum %.1f dB)\n",
+                                mux->signal_dbm, mux->cnr_db,
+                                MIN_RELIABLE_CNR_DB);
+                    } else {
+                        fprintf(dest,
+                                "# ZapLink disabled weak multiplex: no tuner lock\n");
+                    }
+                }
+            }
+        }
+
+        if (disabled) fprintf(dest, "# %s", line);
+        else fputs(line, dest);
+    }
+
+    int ok = !ferror(source) && fflush(dest) == 0 && fsync(temp_fd) == 0;
+    fclose(source);
+    if (fclose(dest) != 0) ok = 0;
+
+    if (ok && rename(temp_path, config_path) == 0) return 1;
+    unlink(temp_path);
+    return 0;
+}
+
+int scanner_validate_signals(const char *config_path, int adapter,
+                             int include_weak) {
+    ScanMultiplex multiplexes[MAX_MULTIPLEXES];
+    int section_mux[MAX_SCAN_SECTIONS];
+    int mux_count = 0;
+    int section_count = 0;
+
+    if (!load_scan_multiplexes(config_path, multiplexes, &mux_count,
+                               section_mux, &section_count)) {
+        printf("[SCANNER] No multiplexes available for signal validation.\n");
+        return -1;
+    }
+
+    printf("\n[SCANNER] Validating %d multiplexes (minimum %.1f dB C/N)...\n",
+           mux_count, MIN_RELIABLE_CNR_DB);
+    int weak_count = 0;
+    for (int i = 0; i < mux_count; i++) {
+        measure_multiplex(config_path, adapter, &multiplexes[i]);
+        if (multiplexes[i].weak) weak_count++;
+
+        double mhz = strtod(multiplexes[i].frequency, NULL) / 1000000.0;
+        if (multiplexes[i].has_lock) {
+            printf(" [%s] %.0f MHz (%s): %.1f dBm, %.1f dB C/N\n",
+                   multiplexes[i].weak ? "WEAK" : "OK", mhz,
+                   multiplexes[i].channel_name, multiplexes[i].signal_dbm,
+                   multiplexes[i].cnr_db);
+        } else {
+            printf(" [WEAK] %.0f MHz (%s): no tuner lock\n", mhz,
+                   multiplexes[i].channel_name);
+        }
+    }
+
+    if (weak_count == 0) {
+        printf("[SCANNER] All multiplexes meet the signal threshold.\n");
+    } else if (include_weak) {
+        printf("[SCANNER] Retaining %d weak multiplex%s by user request.\n",
+               weak_count, weak_count == 1 ? "" : "es");
+    } else if (comment_weak_sections(config_path, multiplexes, section_mux,
+                                     section_count)) {
+        printf("[SCANNER] Commented out %d weak multiplex%s in %s.\n",
+               weak_count, weak_count == 1 ? "" : "es", config_path);
+    } else {
+        printf("[SCANNER] Warning: failed to comment weak channels in %s.\n",
+               config_path);
+    }
+    return weak_count;
+}
 
 // ATSC Center Frequencies (kHz)
 static int get_center_freq(int channel) {
@@ -395,6 +664,16 @@ int scanner_check(const char *config_path) {
     if (fgets(buf, sizeof(buf), stdin)) {
         if (buf[0] == 'y' || buf[0] == 'Y') skip_vhf = 1;
     }
+
+    // Weak Signal Option
+    int include_weak = 0;
+    printf("\nInclude weak channels below %.1f dB C/N? Weak reception can\n",
+           MIN_RELIABLE_CNR_DB);
+    printf("cause Jellyfin streams to fail. Excluded channels remain in\n");
+    printf("channels.conf as comments for later review. [y/N]: ");
+    if (fgets(buf, sizeof(buf), stdin)) {
+        if (buf[0] == 'y' || buf[0] == 'Y') include_weak = 1;
+    }
     
     char master_scan_file[] = "/tmp/zapcore_master_scan.conf";
     if (zip[0]) fetch_and_process(zip, master_scan_file, skip_vhf);
@@ -411,6 +690,7 @@ int scanner_check(const char *config_path) {
     run_parallel_scan(adapters, part_files, config_path);
     
     if (access(config_path, F_OK) == 0) {
+        scanner_validate_signals(config_path, 0, include_weak);
         printf("\n[SUCCESS] Configuration generated! Exiting.\n");
         return 1;
     }

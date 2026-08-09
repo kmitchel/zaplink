@@ -48,6 +48,10 @@ int main(int argc, char *argv[]) {
 
     // Ignore SIGPIPE (handled by checking write return values)
     signal(SIGPIPE, SIG_IGN);
+
+    // USB DVB devices can appear a few seconds after the service starts.
+    // Wait before either the scanner or the streaming engine enumerates them.
+    wait_for_tuners(TUNER_WAIT_TIMEOUT_SECONDS);
     
     // Handle manual scan request
     if (force_scan) {
