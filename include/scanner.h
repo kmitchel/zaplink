@@ -19,9 +19,10 @@
  * 3. Creates channels.conf on success
  * 
  * @param config_path Path to check for channels.conf
- * @return 1 if wizard ran and requires restart, 0 to continue normal startup
+ * @param force_scan Run the wizard even if a configuration already exists
+ * @return 1 after a successful scan, 0 if no scan was needed, -1 on failure
  */
-int scanner_check(const char *config_path);
+int scanner_check(const char *config_path, int force_scan);
 
 /**
  * Measure every multiplex in a generated channel configuration.

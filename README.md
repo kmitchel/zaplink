@@ -8,7 +8,8 @@ ZapLink has been hardened for production environments:
 
 -   **Shell Removal**: The transcoding pipeline uses direct `fork`/`execvp` calls, eliminating shell injection vulnerabilities associated with `system()` or `popen()`.
 -   **Argument Safety**: STRICT enforcement of argument limits (128) prevents buffer overflow attacks. The system aborts execution if command line arguments exceed safe limits.
--   **HTTP Robustness**: Hardened request parser enforces 4KB header limits and proper termination checks to prevent DoS from slow or malformed clients.
+-   **HTTP Robustness**: The request parser enforces 4KB headers, a 10-second header deadline, bounded pending connections, exact query parsing, and strict parameter ranges.
+-   **Bounded Streaming**: Pipelines that produce no data or stall for 15 seconds are terminated and return an HTTP error when possible.
 
 ## Features
 - **Automatic Channel Scan**: Parallel tuner scanning with RabbitEars zip-code hints and optional VHF skipping.
@@ -17,6 +18,7 @@ ZapLink has been hardened for production environments:
 - **Robust EPG**: Background EPG collection with valid XMLTV output supporting Jellyfin Series Recording.
 - **Live Streaming**: Supports software and hardware transcoding (QSV, VAAPI, NVENC) via FFmpeg.
 - **Simple API**: HTTP endpoints for M3U playlists and XMLTV guide data.
+- **Journal Logging**: Plain key/value logs use syslog priority prefixes understood by journald and contain no terminal color sequences.
 
 ## Requirements
 - Linux with DVB/ATSC hardware (`/dev/dvb/adapter*`).
@@ -49,6 +51,8 @@ sudo make install
 - Install `huffman.bin` to `/opt/zaplink/`.
 - Create a `zaplink` user.
 - Install and enable the `zaplink.service`.
+- Add the service account to available `video` and `render` groups.
+- Install a hardened unit with `/opt/zaplink` as its only writable system path.
 
 **Note:** `channels.conf` is *not* overwritten or installed by default to prevent valid configs from being lost. Use the `-s` flag to generate it if missing, or copy it manually if you have a backup.
 
@@ -64,6 +68,13 @@ sudo systemctl status zaplink
 Logs can be viewed via journalctl:
 ```sh
 sudo journalctl -u zaplink -f
+```
+
+Log records are single-line, color-free entries suitable for filtering and
+forwarding. For example:
+
+```text
+timestamp=2026-08-09T20:17:54Z level=INFO component=TUNER message=2 usable DVB frontends ready
 ```
 
 ### Manual Usage
@@ -108,12 +119,12 @@ nodes, typically through membership in the `video` group.
 ### Channel Scanning and Signal Filtering
 
 The interactive scanner can be run from the installed directory. Stop the
-service first so the scanner has exclusive access to the tuners. Because `-s`
-removes the active configuration before scanning, preserve a backup first:
+service first so the scanner has exclusive access to the tuners. It writes and
+validates a candidate file first; the active configuration remains untouched
+after any scan failure and is replaced atomically only after success:
 
 ```sh
 sudo systemctl stop zaplink
-sudo cp /opt/zaplink/channels.conf /opt/zaplink/channels.conf.backup
 cd /opt/zaplink
 sudo -u zaplink ./zaplink -s
 sudo systemctl start zaplink
@@ -125,6 +136,10 @@ The scanner asks whether to:
 2. Use a ZIP code for RabbitEars frequency hints.
 3. Skip VHF RF channels 2–13.
 4. Include weak channels below 20 dB C/N.
+
+The setup wizard requires an interactive terminal. If `channels.conf` is
+missing during systemd startup, ZapLink exits with a clear error instead of
+repeatedly prompting on closed standard input.
 
 After discovery, ZapLink tunes one representative service from every unique RF
 multiplex and averages the lock samples reported by `dvbv5-zap`. A multiplex is
@@ -153,7 +168,12 @@ Base URL: `http://<host>:18392`
 
 - `GET /playlist.m3u`: M3U playlist for Jellyfin/VLC.
 - `GET /xmltv.xml`: XMLTV EPG data (Jellyfin compatible).
-- `GET /stream/<channel>`: Live stream (e.g., `/stream/15.1`).
+- `GET /stream/<channel-id>`: Live stream (e.g., `/stream/15.1`).
+
+Normally the channel ID is its virtual channel number. If multiple received
+stations advertise the same number, the playlist and XMLTV feed use a stable
+frequency/service-qualified ID such as `15.1-581000000-3`. Requests using an
+ambiguous bare number are rejected instead of silently tuning the first match.
 
 ### Streaming Parameters
 All parameters are optional and can be appended to stream URLs or the playlist URL.
@@ -234,6 +254,15 @@ A live stream normally ends this test with curl timeout status 28; HTTP 200 and
 a nonzero byte count confirm that transport data was received. If zero bytes
 are returned, inspect `journalctl -u zaplink` for tuner discovery, no-tuner, or
 stream-stall messages.
+
+## Verification
+
+Run the build and regression tests for channel identity, tuner lease preemption,
+and concurrent EPG database writers with:
+
+```sh
+make test
+```
 
 **Note (Windows users):** When using URLs with `&` in Command Prompt, wrap the URL in quotes:
 ```cmd

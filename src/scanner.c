@@ -9,11 +9,13 @@
 #include <glob.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <signal.h>
+#include "log.h"
 #include "scanner.h"
 #include "config.h"
 
 #define RABBIT_EARS_URL "https://www.rabbitears.info/search.php?request=zip_search&zipcode="
-#define MAX_ADAPTERS 16
+#define MAX_ADAPTERS MAX_TUNERS
 #define MAX_MULTIPLEXES 128
 #define MAX_SCAN_SECTIONS 512
 
@@ -24,6 +26,8 @@ typedef struct {
     char buffer[4096];  // Larger buffer for verbose dvbv5-scan output
     int buf_len;
     int overflow_warned; // Track if we've warned about overflow
+    int wait_status;
+    int status_valid;
 } ScanWorker;
 
 typedef struct {
@@ -288,6 +292,7 @@ int scanner_validate_signals(const char *config_path, int adapter,
     } else {
         printf("[SCANNER] Warning: failed to comment weak channels in %s.\n",
                config_path);
+        return -1;
     }
     return weak_count;
 }
@@ -307,16 +312,20 @@ static int get_adapter_count() {
     if (glob("/dev/dvb/adapter*", 0, NULL, &g) != 0) {
         return 0;
     }
-    int count = g.gl_pathc;
+    int count = (int)g.gl_pathc;
     globfree(&g);
+    if (count > MAX_ADAPTERS) {
+        printf("[SCANNER] Detected %d adapters; using the first %d.\n",
+               count, MAX_ADAPTERS);
+        count = MAX_ADAPTERS;
+    }
     return count;
 }
 
-static void fetch_and_process(const char *zip, const char *scan_file, int skip_vhf) {
+static int fetch_and_process(const char *zip, const char *scan_file,
+                             const char *tmp_html, int skip_vhf) {
     char url[256];
     snprintf(url, sizeof(url), "%s%s", RABBIT_EARS_URL, zip);
-    
-    char tmp_html[] = "/tmp/zapcore_scan.html";
     
     printf("[SCANNER] Querying RabbitEars for %s...%s\n", zip, skip_vhf ? " (skipping VHF)" : "");
     
@@ -374,7 +383,7 @@ static void fetch_and_process(const char *zip, const char *scan_file, int skip_v
     }
     
     FILE *out = fopen(scan_file, "w");
-    if (!out) return;
+    if (!out) return 0;
     
     for (int i = 2; i <= 69; i++) {
         if (found_channels[i]) {
@@ -387,17 +396,28 @@ static void fetch_and_process(const char *zip, const char *scan_file, int skip_v
         }
     }
     fclose(out);
+    return 1;
 }
 
 // Split the master scan list into N temporary files
-static void split_scan_list(const char *scan_file, int parts, char part_files[][64]) {
+static int split_scan_list(const char *scan_file, int parts,
+                           char part_files[][128]) {
+    if (parts < 1 || parts > MAX_ADAPTERS) return 0;
     FILE *in = fopen(scan_file, "r");
-    if (!in) return;
+    if (!in) return 0;
     
     FILE *outs[MAX_ADAPTERS];
     for (int i = 0; i < parts; i++) {
-        snprintf(part_files[i], 64, "%s.part%d", scan_file, i);
+        snprintf(part_files[i], 128, "%s.part%d", scan_file, i);
         outs[i] = fopen(part_files[i], "w");
+        if (!outs[i]) {
+            for (int j = 0; j < i; j++) {
+                fclose(outs[j]);
+                unlink(part_files[j]);
+            }
+            fclose(in);
+            return 0;
+        }
     }
     
     char line[256];
@@ -415,6 +435,7 @@ static void split_scan_list(const char *scan_file, int parts, char part_files[][
     for (int i = 0; i < parts; i++) {
         if (outs[i]) fclose(outs[i]);
     }
+    return 1;
 }
 
 static void parse_output_line(int tuner_id, char *line) {
@@ -450,7 +471,40 @@ static void parse_output_line(int tuner_id, char *line) {
     }
 }
 
-static void run_parallel_scan(int num_adapters, char part_files[][64], const char *dest_file) {
+static int config_has_valid_service(const char *path) {
+    FILE *input = fopen(path, "r");
+    if (!input) return 0;
+    char line[512];
+    int in_section = 0;
+    int has_frequency = 0;
+    int has_service = 0;
+    int has_vchannel = 0;
+    int valid = 0;
+    while (fgets(line, sizeof(line), input)) {
+        char *text = skip_space(line);
+        if (*text == '#' || *text == ';') continue;
+        if (*text == '[') {
+            if (in_section && has_frequency && has_service && has_vchannel) {
+                valid = 1;
+                break;
+            }
+            in_section = 1;
+            has_frequency = has_service = has_vchannel = 0;
+        } else if (in_section) {
+            if (strncmp(text, "FREQUENCY", 9) == 0) has_frequency = 1;
+            else if (strncmp(text, "SERVICE_ID", 10) == 0) has_service = 1;
+            else if (strncmp(text, "VCHANNEL", 8) == 0) has_vchannel = 1;
+        }
+    }
+    if (!valid && in_section && has_frequency && has_service && has_vchannel) {
+        valid = 1;
+    }
+    fclose(input);
+    return valid;
+}
+
+static int run_parallel_scan(int num_adapters, char part_files[][128],
+                             const char *dest_file) {
     ScanWorker workers[MAX_ADAPTERS];
     memset(workers, 0, sizeof(workers));
     int active_workers = 0;
@@ -472,7 +526,7 @@ static void run_parallel_scan(int num_adapters, char part_files[][64], const cha
             dup2(pipefd[1], STDOUT_FILENO); // Capture stdout too? usually configs go to -o file
             close(pipefd[1]);
             
-            char out_part[64];
+            char out_part[128];
             snprintf(out_part, sizeof(out_part), "%s.out", part_files[i]);
             
             char adapter_arg[16];
@@ -495,6 +549,10 @@ static void run_parallel_scan(int num_adapters, char part_files[][64], const cha
             workers[i].buf_len = 0;
             workers[i].overflow_warned = 0;
             active_workers++;
+        } else {
+            close(pipefd[0]);
+            close(pipefd[1]);
+            LOG_ERROR("SCANNER", "Unable to fork scanner for adapter %d", i);
         }
     }
     
@@ -578,7 +636,8 @@ static void run_parallel_scan(int num_adapters, char part_files[][64], const cha
                     } else {
                         // EOF
                         close(workers[i].pipe_fd);
-                        waitpid(workers[i].pid, NULL, 0);
+                        workers[i].status_valid =
+                            waitpid(workers[i].pid, &workers[i].wait_status, 0) > 0;
                         workers[i].pid = 0; // Mark done
                         active_workers--;
                     }
@@ -591,39 +650,95 @@ static void run_parallel_scan(int num_adapters, char part_files[][64], const cha
                  if (workers[i].pid > 0) {
                     int status;
                     if (waitpid(workers[i].pid, &status, WNOHANG) > 0) {
+                         workers[i].wait_status = status;
+                         workers[i].status_valid = 1;
                          close(workers[i].pipe_fd);
                          workers[i].pid = 0;
                          active_workers--;
                     }
                  }
             }
+        } else if (ret < 0 && errno != EINTR) {
+            LOG_ERROR("SCANNER", "select failed: %s", strerror(errno));
+            break;
+        }
+    }
+
+    for (int i = 0; i < num_adapters; i++) {
+        if (workers[i].pid > 0) {
+            kill(workers[i].pid, SIGTERM);
+            workers[i].status_valid =
+                waitpid(workers[i].pid, &workers[i].wait_status, 0) > 0;
+            close(workers[i].pipe_fd);
+            workers[i].pid = 0;
+        }
+        if (workers[i].status_valid &&
+            (!WIFEXITED(workers[i].wait_status) ||
+             WEXITSTATUS(workers[i].wait_status) != 0)) {
+            LOG_WARN("SCANNER", "Scan worker %d exited unsuccessfully", i);
         }
     }
     
     // Merge
     printf("[SCANNER] Merging results...\n");
+    int valid_parts = 0;
+    for (int i = 0; i < num_adapters; i++) {
+        char part_out[128];
+        snprintf(part_out, sizeof(part_out), "%s.out", part_files[i]);
+        if (config_has_valid_service(part_out)) valid_parts++;
+    }
+    if (valid_parts == 0) {
+        LOG_ERROR("SCANNER", "No scan worker produced a valid channel service");
+        for (int i = 0; i < num_adapters; i++) {
+            char part_out[128];
+            snprintf(part_out, sizeof(part_out), "%s.out", part_files[i]);
+            unlink(part_out);
+            unlink(part_files[i]);
+        }
+        return 0;
+    }
+
     FILE *dest = fopen(dest_file, "w");
-    if (!dest) return;
+    if (!dest) {
+        for (int i = 0; i < num_adapters; i++) {
+            char part_out[128];
+            snprintf(part_out, sizeof(part_out), "%s.out", part_files[i]);
+            unlink(part_out);
+            unlink(part_files[i]);
+        }
+        return 0;
+    }
     
     for (int i = 0; i < num_adapters; i++) {
-        char part_out[64];
+        char part_out[128];
         snprintf(part_out, sizeof(part_out), "%s.out", part_files[i]);
-        FILE *src = fopen(part_out, "r");
+        FILE *src = config_has_valid_service(part_out) ? fopen(part_out, "r") : NULL;
         if (src) {
-            char ch;
+            int ch;
             while ((ch = fgetc(src)) != EOF) fputc(ch, dest);
             fclose(src);
             unlink(part_out); // Cleanup
         }
         unlink(part_files[i]); // Cleanup input part
     }
-    fclose(dest);
+    int ok = !ferror(dest) && fflush(dest) == 0;
+    if (fclose(dest) != 0) ok = 0;
+    if (!ok || !config_has_valid_service(dest_file)) {
+        unlink(dest_file);
+        return 0;
+    }
     printf("[SCANNER] Scan complete! Saved to %s\n", dest_file);
+    return 1;
 }
 
-int scanner_check(const char *config_path) {
-    if (access(config_path, F_OK) == 0) {
-        return 0; 
+int scanner_check(const char *config_path, int force_scan) {
+    int config_exists = access(config_path, F_OK) == 0;
+    if (config_exists && !force_scan) return 0;
+
+    if (!isatty(STDIN_FILENO)) {
+        LOG_ERROR("SCANNER",
+                  "Interactive channel setup requires a terminal; run zaplink -s manually");
+        return -1;
     }
     
     printf("\n============================================\n");
@@ -637,17 +752,18 @@ int scanner_check(const char *config_path) {
         return 0; // Can't scan
     }
     
-    printf("No channels.conf found. Run Automatic Channel Scanner? [Y/n]: ");
+    printf("%s Run Automatic Channel Scanner? [Y/n]: ",
+           config_exists ? "Replace the current channels.conf?" :
+                           "No channels.conf found.");
     char buf[16];
-    if (fgets(buf, sizeof(buf), stdin)) {
-        if (buf[0] == 'n' || buf[0] == 'N') return 0;
-    }
+    if (!fgets(buf, sizeof(buf), stdin)) return -1;
+    if (buf[0] == 'n' || buf[0] == 'N') return config_exists ? 0 : -1;
     
     // Zip Code Input
     char zip[16] = {0};
     while (1) {
         printf("Enter your Zip Code (or leave empty for full scan): ");
-        if (!fgets(zip, sizeof(zip), stdin)) continue;
+        if (!fgets(zip, sizeof(zip), stdin)) return -1;
         zip[strcspn(zip, "\n")] = 0;
         
         if (zip[0] == '\0') break; 
@@ -661,9 +777,8 @@ int scanner_check(const char *config_path) {
     int skip_vhf = 0;
     printf("\nSkip VHF channels (RF 2-13)? VHF reception often requires\n");
     printf("a larger antenna and is more prone to interference. [y/N]: ");
-    if (fgets(buf, sizeof(buf), stdin)) {
-        if (buf[0] == 'y' || buf[0] == 'Y') skip_vhf = 1;
-    }
+    if (!fgets(buf, sizeof(buf), stdin)) return -1;
+    if (buf[0] == 'y' || buf[0] == 'Y') skip_vhf = 1;
 
     // Weak Signal Option
     int include_weak = 0;
@@ -671,28 +786,97 @@ int scanner_check(const char *config_path) {
            MIN_RELIABLE_CNR_DB);
     printf("cause Jellyfin streams to fail. Excluded channels remain in\n");
     printf("channels.conf as comments for later review. [y/N]: ");
-    if (fgets(buf, sizeof(buf), stdin)) {
-        if (buf[0] == 'y' || buf[0] == 'Y') include_weak = 1;
-    }
+    if (!fgets(buf, sizeof(buf), stdin)) return -1;
+    if (buf[0] == 'y' || buf[0] == 'Y') include_weak = 1;
     
-    char master_scan_file[] = "/tmp/zapcore_master_scan.conf";
-    if (zip[0]) fetch_and_process(zip, master_scan_file, skip_vhf);
-    else fetch_and_process("00000", master_scan_file, skip_vhf);
+    char temp_directory[] = "/tmp/zaplink-scan.XXXXXX";
+    if (!mkdtemp(temp_directory)) {
+        LOG_ERROR("SCANNER", "Unable to create temporary scan directory: %s",
+                  strerror(errno));
+        return -1;
+    }
+    char master_scan_file[64];
+    char scan_html[64];
+    snprintf(master_scan_file, sizeof(master_scan_file), "%s/master.conf",
+             temp_directory);
+    snprintf(scan_html, sizeof(scan_html), "%s/rabbitears.html",
+             temp_directory);
+    if (!fetch_and_process(zip[0] ? zip : "00000", master_scan_file,
+                           scan_html, skip_vhf)) {
+        LOG_ERROR("SCANNER", "Unable to create the RF scan list");
+        unlink(scan_html);
+        unlink(master_scan_file);
+        rmdir(temp_directory);
+        return -1;
+    }
     
     printf("\nReady to scan. Please ensure your antenna is connected.\n");
     printf("Press ENTER to start scanning...");
-    fgets(buf, sizeof(buf), stdin);
-    
-    char part_files[MAX_ADAPTERS][64];
-    split_scan_list(master_scan_file, adapters, part_files);
-    unlink(master_scan_file);
-    
-    run_parallel_scan(adapters, part_files, config_path);
-    
-    if (access(config_path, F_OK) == 0) {
-        scanner_validate_signals(config_path, 0, include_weak);
-        printf("\n[SUCCESS] Configuration generated! Exiting.\n");
-        return 1;
+    if (!fgets(buf, sizeof(buf), stdin)) {
+        unlink(scan_html);
+        unlink(master_scan_file);
+        rmdir(temp_directory);
+        return -1;
     }
-    return 0;
+    
+    char part_files[MAX_ADAPTERS][128] = {{0}};
+    if (!split_scan_list(master_scan_file, adapters, part_files)) {
+        LOG_ERROR("SCANNER", "Unable to divide the RF scan list");
+        unlink(scan_html);
+        unlink(master_scan_file);
+        rmdir(temp_directory);
+        return -1;
+    }
+    unlink(master_scan_file);
+
+    char candidate_path[1024];
+    if (snprintf(candidate_path, sizeof(candidate_path), "%s.scan.XXXXXX",
+                 config_path) >= (int)sizeof(candidate_path)) {
+        LOG_ERROR("SCANNER", "Configuration path is too long");
+        for (int i = 0; i < adapters; i++) unlink(part_files[i]);
+        unlink(scan_html);
+        rmdir(temp_directory);
+        return -1;
+    }
+    int candidate_fd = mkstemp(candidate_path);
+    if (candidate_fd < 0) {
+        LOG_ERROR("SCANNER", "Unable to create scan candidate: %s",
+                  strerror(errno));
+        for (int i = 0; i < adapters; i++) unlink(part_files[i]);
+        unlink(scan_html);
+        rmdir(temp_directory);
+        return -1;
+    }
+    close(candidate_fd);
+
+    int scan_ok = run_parallel_scan(adapters, part_files, candidate_path);
+    unlink(scan_html);
+    rmdir(temp_directory);
+    if (!scan_ok) {
+        unlink(candidate_path);
+        LOG_ERROR("SCANNER", "Channel scan failed; existing configuration was preserved");
+        return -1;
+    }
+
+    if (scanner_validate_signals(candidate_path, 0, include_weak) < 0) {
+        unlink(candidate_path);
+        LOG_ERROR("SCANNER", "Signal validation failed; existing configuration was preserved");
+        return -1;
+    }
+
+    if (!config_has_valid_service(candidate_path)) {
+        unlink(candidate_path);
+        LOG_ERROR("SCANNER", "Scan candidate contains no active services");
+        return -1;
+    }
+
+    if (rename(candidate_path, config_path) != 0) {
+        LOG_ERROR("SCANNER", "Unable to install scan candidate: %s",
+                  strerror(errno));
+        unlink(candidate_path);
+        return -1;
+    }
+
+    printf("\n[SUCCESS] Configuration generated atomically! Exiting.\n");
+    return 1;
 }

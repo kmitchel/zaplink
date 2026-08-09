@@ -2,20 +2,56 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/wait.h>
+#include <unistd.h>
+#include <fcntl.h>
 #include "benchmark.h"
 #include "log.h"
 
-static int test_encoder(const char *name, const char *ffmpeg_args) {
-    char cmd[512];
-    // Redirect all output to /dev/null for clean benchmark output
-    snprintf(cmd, sizeof(cmd), 
-        "ffmpeg -v quiet -f lavfi -i testsrc=duration=1:size=1280x720:rate=30 -c:v %s %s -f null - >/dev/null 2>&1", 
-        name, ffmpeg_args);
-    int res = system(cmd);
-    return (WIFEXITED(res) && WEXITSTATUS(res) == 0);
+static int test_encoder(char *name, char *const extra_args[]) {
+    pid_t pid = fork();
+    if (pid == 0) {
+        int devnull = open("/dev/null", O_RDWR);
+        if (devnull >= 0) {
+            dup2(devnull, STDOUT_FILENO);
+            dup2(devnull, STDERR_FILENO);
+            close(devnull);
+        }
+
+        char *args[32];
+        int count = 0;
+        args[count++] = "ffmpeg";
+        args[count++] = "-v";
+        args[count++] = "quiet";
+        args[count++] = "-f";
+        args[count++] = "lavfi";
+        args[count++] = "-i";
+        args[count++] = "testsrc=duration=1:size=1280x720:rate=30";
+        args[count++] = "-c:v";
+        args[count++] = name;
+        for (int i = 0; extra_args && extra_args[i] && count < 27; i++) {
+            args[count++] = extra_args[i];
+        }
+        args[count++] = "-f";
+        args[count++] = "null";
+        args[count++] = "-";
+        args[count] = NULL;
+        execvp(args[0], args);
+        _exit(127);
+    }
+    if (pid < 0) return 0;
+    int status;
+    return waitpid(pid, &status, 0) == pid && WIFEXITED(status) &&
+           WEXITSTATUS(status) == 0;
 }
 
 void run_transcode_benchmark() {
+    static char *no_args[] = {NULL};
+    static char *software_args[] = {"-preset", "ultrafast", NULL};
+    static char *av1_args[] = {"-preset", "10", NULL};
+    static char *vaapi_args[] = {
+        "-vaapi_device", "/dev/dri/renderD128", "-vf",
+        "format=nv12,hwupload", NULL
+    };
     printf("\n");
     printf("==========================================================\n");
     printf("           ZapLink Transcoding Benchmark                  \n");
@@ -27,33 +63,33 @@ void run_transcode_benchmark() {
     fflush(stdout);
     
     // Test H.264
-    h264[0] = test_encoder("libx264", "-preset ultrafast");
+    h264[0] = test_encoder("libx264", software_args);
     printf("."); fflush(stdout);
-    h264[1] = test_encoder("h264_qsv", "");
+    h264[1] = test_encoder("h264_qsv", no_args);
     printf("."); fflush(stdout);
-    h264[2] = test_encoder("h264_nvenc", "");
+    h264[2] = test_encoder("h264_nvenc", no_args);
     printf("."); fflush(stdout);
-    h264[3] = test_encoder("h264_vaapi", "-vaapi_device /dev/dri/renderD128 -vf 'format=nv12,hwupload'");
+    h264[3] = test_encoder("h264_vaapi", vaapi_args);
     printf("."); fflush(stdout);
     
     // Test HEVC
-    hevc[0] = test_encoder("libx265", "-preset ultrafast");
+    hevc[0] = test_encoder("libx265", software_args);
     printf("."); fflush(stdout);
-    hevc[1] = test_encoder("hevc_qsv", "");
+    hevc[1] = test_encoder("hevc_qsv", no_args);
     printf("."); fflush(stdout);
-    hevc[2] = test_encoder("hevc_nvenc", "");
+    hevc[2] = test_encoder("hevc_nvenc", no_args);
     printf("."); fflush(stdout);
-    hevc[3] = test_encoder("hevc_vaapi", "-vaapi_device /dev/dri/renderD128 -vf 'format=nv12,hwupload'");
+    hevc[3] = test_encoder("hevc_vaapi", vaapi_args);
     printf("."); fflush(stdout);
     
     // Test AV1
-    av1[0] = test_encoder("libsvtav1", "-preset 10");
+    av1[0] = test_encoder("libsvtav1", av1_args);
     printf("."); fflush(stdout);
-    av1[1] = test_encoder("av1_qsv", "");
+    av1[1] = test_encoder("av1_qsv", no_args);
     printf("."); fflush(stdout);
-    av1[2] = test_encoder("av1_nvenc", "");
+    av1[2] = test_encoder("av1_nvenc", no_args);
     printf("."); fflush(stdout);
-    av1[3] = test_encoder("av1_vaapi", "-vaapi_device /dev/dri/renderD128 -vf 'format=nv12,hwupload'");
+    av1[3] = test_encoder("av1_vaapi", vaapi_args);
     printf(" done!\n\n");
     
     // Summary table

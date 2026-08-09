@@ -18,6 +18,7 @@ struct thread_pool {
     job_t *job_head;
     job_t *job_tail;
     int num_threads;
+    int threads_created;
     int shutdown;
     int working_count;  // Number of threads currently executing a job
     int queue_count;    // Number of jobs waiting in the queue
@@ -72,6 +73,7 @@ thread_pool_t *thread_pool_create(int num_threads) {
     if (!pool) return NULL;
 
     pool->num_threads = num_threads;
+    pool->threads_created = 0;
     pool->shutdown = 0;
     pool->working_count = 0;
     pool->queue_count = 0;
@@ -89,7 +91,7 @@ thread_pool_t *thread_pool_create(int num_threads) {
         return NULL;
     }
 
-    pool->threads = (pthread_t *)malloc(sizeof(pthread_t) * num_threads);
+    pool->threads = (pthread_t *)calloc((size_t)num_threads, sizeof(pthread_t));
     if (!pool->threads) {
         pthread_mutex_destroy(&pool->lock);
         pthread_cond_destroy(&pool->notify);
@@ -99,9 +101,10 @@ thread_pool_t *thread_pool_create(int num_threads) {
 
     for (int i = 0; i < num_threads; i++) {
         if (pthread_create(&pool->threads[i], NULL, thread_worker, pool) != 0) {
-            thread_pool_destroy(pool); // Cleanup what we can
+            thread_pool_destroy(pool);
             return NULL;
         }
+        pool->threads_created++;
     }
 
     return pool;
@@ -165,12 +168,8 @@ void thread_pool_destroy(thread_pool_t *pool) {
     pthread_cond_broadcast(&pool->notify);
     pthread_mutex_unlock(&pool->lock);
 
-    for (int i = 0; i < pool->num_threads; i++) {
-        // Only join if valid thread ID (simple init check assumed)
-        // In a strictly robust version we might track valid threads separately, 
-        // but for now we assume create succeeded or partial destroy logic isn't perfectly granular on threads array.
-        // Actually, let's assume they were created if pool->threads exists.
-        if (pool->threads) pthread_join(pool->threads[i], NULL);
+    for (int i = 0; i < pool->threads_created; i++) {
+        pthread_join(pool->threads[i], NULL);
     }
 
     if (pool->threads) free(pool->threads);

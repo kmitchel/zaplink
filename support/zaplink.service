@@ -6,10 +6,22 @@ After=network.target
 Type=simple
 User=zaplink
 Group=zaplink
+SupplementaryGroups=video render
 WorkingDirectory=/opt/zaplink
 ExecStart=/opt/zaplink/zaplink
-Restart=always
+Restart=on-failure
 RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogLevelPrefix=yes
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/opt/zaplink
+RestrictSUIDSGID=yes
+LockPersonality=yes
+UMask=0027
 
 [Install]
 WantedBy=multi-user.target

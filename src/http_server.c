@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <time.h>
 #include "http_server.h"
 #include "transcode.h"
 #include "channels.h"
@@ -27,19 +28,122 @@ static int shutdown_pipe[2] = {-1, -1};
 static volatile sig_atomic_t http_running = 1;
 static thread_pool_t *pool = NULL;
 #define MAX_STREAMS 20
-static volatile int active_streams = 0;
+static int active_streams = 0;
+static int active_stream_fds[MAX_STREAMS];
+static pthread_mutex_t stream_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t stream_cond = PTHREAD_COND_INITIALIZER;
 
-typedef struct {
+typedef struct client_context {
     int fd;
     char buffer[MAX_HEADER_SIZE];
     size_t total_read;
+    time_t accepted_at;
+    struct client_context *next;
+    int managed_stream;
 } client_context_t;
+
+static client_context_t *pending_clients = NULL;
+static int pending_client_count = 0;
+static int listener_token;
+static int shutdown_token;
+
+void send_response(int sockfd, const char *status, const char *type,
+                   const char *body);
+
+static time_t monotonic_seconds(void) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0;
+    return now.tv_sec;
+}
+
+static void add_pending_client(client_context_t *ctx) {
+    ctx->next = pending_clients;
+    pending_clients = ctx;
+    pending_client_count++;
+}
+
+static void remove_pending_client(client_context_t *ctx) {
+    client_context_t **current = &pending_clients;
+    while (*current) {
+        if (*current == ctx) {
+            *current = ctx->next;
+            ctx->next = NULL;
+            pending_client_count--;
+            return;
+        }
+        current = &(*current)->next;
+    }
+}
+
+static void close_pending_client(client_context_t *ctx) {
+    if (!ctx) return;
+    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, ctx->fd, NULL);
+    close(ctx->fd);
+    remove_pending_client(ctx);
+    free(ctx);
+}
+
+static void expire_pending_clients(void) {
+    time_t now = monotonic_seconds();
+    client_context_t *ctx = pending_clients;
+    while (ctx) {
+        client_context_t *next = ctx->next;
+        if (now > 0 && ctx->accepted_at > 0 &&
+            now - ctx->accepted_at >= HTTP_HEADER_TIMEOUT_SECONDS) {
+            LOG_WARN("HTTP", "Closing idle request header on fd %d", ctx->fd);
+            send_response(ctx->fd, "408 Request Timeout", "text/plain",
+                          "Request header timeout");
+            close_pending_client(ctx);
+        }
+        ctx = next;
+    }
+}
 
 void process_client_request(void *arg);
 
+static int reserve_stream(int fd) {
+    pthread_mutex_lock(&stream_mutex);
+    if (active_streams >= MAX_STREAMS) {
+        pthread_mutex_unlock(&stream_mutex);
+        return 0;
+    }
+    active_stream_fds[active_streams++] = fd;
+    pthread_mutex_unlock(&stream_mutex);
+    return 1;
+}
+
+static void release_stream(int fd) {
+    pthread_mutex_lock(&stream_mutex);
+    for (int i = 0; i < active_streams; i++) {
+        if (active_stream_fds[i] != fd) continue;
+        active_stream_fds[i] = active_stream_fds[active_streams - 1];
+        active_streams--;
+        break;
+    }
+    pthread_cond_broadcast(&stream_cond);
+    pthread_mutex_unlock(&stream_mutex);
+}
+
+static void finish_client(client_context_t *ctx) {
+    if (!ctx) return;
+    if (ctx->managed_stream) release_stream(ctx->fd);
+    close(ctx->fd);
+    free(ctx);
+}
+
+static void stop_active_streams(void) {
+    pthread_mutex_lock(&stream_mutex);
+    for (int i = 0; i < active_streams; i++) {
+        shutdown(active_stream_fds[i], SHUT_RDWR);
+    }
+    while (active_streams > 0) {
+        pthread_cond_wait(&stream_cond, &stream_mutex);
+    }
+    pthread_mutex_unlock(&stream_mutex);
+}
+
 void *stream_worker_entry(void *arg) {
     process_client_request(arg);
-    __atomic_sub_fetch(&active_streams, 1, __ATOMIC_SEQ_CST);
     return NULL;
 }
 
@@ -87,7 +191,7 @@ static void url_decode(char *s) {
     char *dst = s;
     while (*s) {
         if (*s == '%' && s[1] && s[2]) {
-            int val;
+            unsigned int val;
             if (sscanf(s + 1, "%2x", &val) == 1) {
                 *dst++ = (char)val;
                 s += 3;
@@ -105,17 +209,36 @@ static void url_decode(char *s) {
 
 int get_query_param(const char *query, const char *key, char *dest, size_t dest_len) {
     if (!query || !key || !dest || dest_len == 0) return 0;
-    char search[64];
-    snprintf(search, sizeof(search), "%s=", key);
-    char *p = strstr(query, search);
-    if (!p) return 0;
-    p += strlen(search);
-    char *end = strchr(p, '&');
-    size_t len = end ? (size_t)(end - p) : strlen(p);
-    if (len >= dest_len) len = dest_len - 1;
-    strncpy(dest, p, len);
-    dest[len] = '\0';
-    url_decode(dest);
+    size_t key_len = strlen(key);
+    const char *parameter = query;
+    while (*parameter) {
+        const char *end = strchr(parameter, '&');
+        if (!end) end = parameter + strlen(parameter);
+        const char *equals = memchr(parameter, '=', (size_t)(end - parameter));
+        if (equals && (size_t)(equals - parameter) == key_len &&
+            strncmp(parameter, key, key_len) == 0) {
+            const char *value = equals + 1;
+            size_t len = (size_t)(end - value);
+            if (len >= dest_len) return -1;
+            memcpy(dest, value, len);
+            dest[len] = '\0';
+            url_decode(dest);
+            return 1;
+        }
+        parameter = *end ? end + 1 : end;
+    }
+    return 0;
+}
+
+static int parse_bounded_int(const char *text, int minimum, int maximum,
+                             int *value) {
+    if (!text || !*text || !value) return 0;
+    errno = 0;
+    char *end = NULL;
+    long parsed = strtol(text, &end, 10);
+    if (errno != 0 || !end || *end != '\0' || parsed < minimum ||
+        parsed > maximum) return 0;
+    *value = (int)parsed;
     return 1;
 }
 
@@ -148,13 +271,17 @@ void handle_m3u(int sockfd, const char *host, const char *query) {
     size = strlen(m3u);
 
     for (int i = 0; i < channel_count; i++) {
-        char entry[512];
+        char entry[2048];
+        char channel_id[128];
+        get_unique_channel_id(&channels[i], channel_id, sizeof(channel_id));
         if (query && query[0] != '\0') {
-            snprintf(entry, sizeof(entry), "#EXTINF:-1 tvg-id=\"%s\" tvg-name=\"%s\",%s %s\nhttp://%s/stream/%s?%s\n",
-                     channels[i].number, channels[i].name, channels[i].number, channels[i].name, host, channels[i].number, query);
+            snprintf(entry, sizeof(entry), "#EXTINF:-1 tvg-id=\"%.127s\" tvg-name=\"%.63s\",%.31s %.63s\nhttp://%.255s/stream/%.127s?%.1023s\n",
+                     channel_id, channels[i].name, channels[i].number,
+                     channels[i].name, host, channel_id, query);
         } else {
-            snprintf(entry, sizeof(entry), "#EXTINF:-1 tvg-id=\"%s\" tvg-name=\"%s\",%s %s\nhttp://%s/stream/%s\n",
-                     channels[i].number, channels[i].name, channels[i].number, channels[i].name, host, channels[i].number);
+            snprintf(entry, sizeof(entry), "#EXTINF:-1 tvg-id=\"%.127s\" tvg-name=\"%.63s\",%.31s %.63s\nhttp://%.255s/stream/%.127s\n",
+                     channel_id, channels[i].name, channels[i].number,
+                     channels[i].name, host, channel_id);
         }
         
         size_t entry_len = strlen(entry);
@@ -208,8 +335,13 @@ void process_client_request(void *arg) {
     // Note: buffer is guaranteed null-terminated by the reader loop
     if (sscanf(buffer, "%15s %1023s %15s", method, full_path, protocol) != 3) {
         send_response(sockfd, "400 Bad Request", "text/plain", "Malformed request");
-        close(sockfd);
-        free(ctx);
+        finish_client(ctx);
+        return;
+    }
+    if (strcmp(method, "GET") != 0) {
+        send_response(sockfd, "405 Method Not Allowed", "text/plain",
+                      "Only GET is supported");
+        finish_client(ctx);
         return;
     }
 
@@ -254,7 +386,14 @@ void process_client_request(void *arg) {
         }
     } else if (strncmp(path, "/stream/", 8) == 0) {
         StreamConfig config = {0};
-        strncpy(config.channel_num, path + 8, sizeof(config.channel_num)-1);
+        size_t channel_id_length = strlen(path + 8);
+        if (channel_id_length >= sizeof(config.channel_num)) {
+            send_response(sockfd, "414 URI Too Long", "text/plain",
+                          "Channel identifier is too long");
+            finish_client(ctx);
+            return;
+        }
+        memcpy(config.channel_num, path + 8, channel_id_length + 1);
         
         char b_param[64] = {0}, c_param[64] = {0}, br_param[64] = {0}, a_param[64] = {0};
         int has_b = get_query_param(query, "backend", b_param, sizeof(b_param));
@@ -262,16 +401,38 @@ void process_client_request(void *arg) {
         int has_br = get_query_param(query, "bitrate", br_param, sizeof(br_param));
         int has_a = get_query_param(query, "audio", a_param, sizeof(a_param));
 
+        if (has_b < 0 || has_c < 0 || has_br < 0 || has_a < 0) {
+            send_response(sockfd, "400 Bad Request", "text/plain",
+                          "Query parameter is too long");
+            finish_client(ctx);
+            return;
+        }
+
         config.backend = has_b ? parse_backend(b_param) : BACKEND_SOFTWARE;
         config.codec = has_c ? parse_codec(c_param) : CODEC_COPY;
-        config.bitrate_kbps = has_br ? atoi(br_param) : 0;
+        if (config.backend == BACKEND_INVALID || config.codec == CODEC_INVALID) {
+            send_response(sockfd, "400 Bad Request", "text/plain",
+                          "Invalid backend or codec");
+            finish_client(ctx);
+            return;
+        }
+        if (has_br && !parse_bounded_int(br_param, 1, MAX_BITRATE_KBPS,
+                                         &config.bitrate_kbps)) {
+            send_response(sockfd, "400 Bad Request", "text/plain",
+                          "Invalid bitrate");
+            finish_client(ctx);
+            return;
+        }
 
         if (has_a) {
             if (strcmp(a_param, "6") == 0 || strcmp(a_param, "5.1") == 0 || strcmp(a_param, "51") == 0) {
                 config.audio_channels = 6;
-            } else {
-                config.audio_channels = atoi(a_param);
-                if (config.audio_channels < 1 || config.audio_channels > 8) config.audio_channels = 2;
+            } else if (!parse_bounded_int(a_param, 1, 8,
+                                          &config.audio_channels)) {
+                send_response(sockfd, "400 Bad Request", "text/plain",
+                              "Invalid audio channel count");
+                finish_client(ctx);
+                return;
             }
         } else {
             config.audio_channels = 2;
@@ -284,14 +445,13 @@ void process_client_request(void *arg) {
         int is_software_av1 = (config.codec == CODEC_AV1 && config.backend == BACKEND_SOFTWARE);
         char head[256];
         const char *mime = is_software_av1 ? "video/x-matroska" : "video/mp2t";
-        snprintf(head, sizeof(head), "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nConnection: keep-alive\r\nAccess-Control-Allow-Origin: *\r\n\r\n", mime);
+        snprintf(head, sizeof(head), "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n", mime);
         handle_unified_stream(sockfd, &config, head);
     } else {
         send_response(sockfd, "404 Not Found", "text/plain", "ZapLink Engine: Valid endpoints: /stream/{ch}, /playlist.m3u, /xmltv.xml");
     }
 
-    close(sockfd);
-    free(ctx);
+    finish_client(ctx);
 }
 
 void start_http_server(int port) {
@@ -347,7 +507,7 @@ void start_http_server(int port) {
 
     struct epoll_event ev, events[MAX_EVENTS];
     ev.events = EPOLLIN;
-    ev.data.fd = server_fd; // Listener
+    ev.data.ptr = &listener_token;
     if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &ev) < 0) {
         LOG_ERROR("HTTP", "epoll_ctl: listener");
         close(server_fd);
@@ -355,7 +515,7 @@ void start_http_server(int port) {
         return;
     }
 
-    ev.data.fd = shutdown_pipe[0];
+    ev.data.ptr = &shutdown_token;
     if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, shutdown_pipe[0], &ev) < 0) {
         LOG_ERROR("HTTP", "epoll_ctl: pipe");
     }
@@ -363,26 +523,36 @@ void start_http_server(int port) {
     LOG_INFO("HTTP", "Listening optimized (epoll+pool) on port %d", port);
 
     while (http_running) {
-        int nfds = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
+        int nfds = epoll_wait(epoll_fd, events, MAX_EVENTS, 1000);
         if (nfds < 0) {
             if (errno == EINTR) continue;
             LOG_ERROR("HTTP", "epoll_wait failed");
             break;
         }
+        if (nfds == 0) {
+            expire_pending_clients();
+            continue;
+        }
 
         for (int i = 0; i < nfds; i++) {
-            if (events[i].data.fd == shutdown_pipe[0] || !http_running) {
+            if (events[i].data.ptr == &shutdown_token || !http_running) {
                 LOG_INFO("HTTP", "Shutdown requested");
                 goto cleanup;
             }
 
-            if (events[i].data.fd == server_fd) {
+            if (events[i].data.ptr == &listener_token) {
                 // Accept connection
                 struct sockaddr_in client_addr;
                 socklen_t client_len = sizeof(client_addr);
                 int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
                 if (client_fd < 0) {
                     if (errno != EAGAIN && errno != EWOULDBLOCK) LOG_WARN("HTTP", "accept failed");
+                    continue;
+                }
+                if (pending_client_count >= MAX_HTTP_CONNECTIONS) {
+                    send_response(client_fd, "503 Service Unavailable",
+                                  "text/plain", "Too many pending connections");
+                    close(client_fd);
                     continue;
                 }
                 
@@ -393,6 +563,7 @@ void start_http_server(int port) {
                     continue;
                 }
                 ctx->fd = client_fd;
+                ctx->accepted_at = monotonic_seconds();
 
                 struct epoll_event client_ev;
                 client_ev.events = EPOLLIN | EPOLLET;
@@ -400,6 +571,8 @@ void start_http_server(int port) {
                 if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &client_ev) < 0) {
                     close(client_fd);
                     free(ctx);
+                } else {
+                    add_pending_client(ctx);
                 }
             } else {
                 // Read from client in loop for EPOLLET
@@ -412,13 +585,11 @@ void start_http_server(int port) {
                             break; // Drained
                         }
                         // Error
-                        close(ctx->fd);
-                        free(ctx);
+                        close_pending_client(ctx);
                         break;
                     } else if (n == 0) {
                         // EOF
-                        close(ctx->fd);
-                        free(ctx);
+                        close_pending_client(ctx);
                         break;
                     }
 
@@ -428,22 +599,23 @@ void start_http_server(int port) {
                 if (strstr(ctx->buffer, "\r\n\r\n")) {
                     // Full header receive
                     epoll_ctl(epoll_fd, EPOLL_CTL_DEL, ctx->fd, NULL);
+                    remove_pending_client(ctx);
                     
                     // Pre-parse to determine dispatch target
                     char method[16], path[1024];
                     if (sscanf(ctx->buffer, "%15s %1023s", method, path) == 2) {
                         if (strncmp(path, "/stream/", 8) == 0) {
                             // Direct streaming request -> Detached thread
-                            if (__atomic_fetch_add(&active_streams, 1, __ATOMIC_SEQ_CST) >= MAX_STREAMS) {
-                                __atomic_sub_fetch(&active_streams, 1, __ATOMIC_SEQ_CST);
+                            if (!reserve_stream(ctx->fd)) {
                                 LOG_WARN("HTTP", "Max concurrent streams reached, dropping request");
                                 send_response(ctx->fd, "503 Service Unavailable", "text/plain", "Too many streams");
                                 close(ctx->fd);
                                 free(ctx);
                             } else {
+                                ctx->managed_stream = 1;
                                 pthread_t tid;
                                 if (pthread_create(&tid, NULL, stream_worker_entry, ctx) != 0) {
-                                    __atomic_sub_fetch(&active_streams, 1, __ATOMIC_SEQ_CST);
+                                    release_stream(ctx->fd);
                                     LOG_ERROR("HTTP", "Failed to spawn stream thread");
                                     close(ctx->fd);
                                     free(ctx);
@@ -472,16 +644,18 @@ void start_http_server(int port) {
                     
                     if (ctx->total_read >= sizeof(ctx->buffer) - 1) {
                         send_response(ctx->fd, "431 Request Header Fields Too Large", "text/plain", "Too large");
-                        close(ctx->fd);
-                        free(ctx);
+                        close_pending_client(ctx);
                         break;
                     }
                 }
             }
         }
+        expire_pending_clients();
     }
 
 cleanup:
+    while (pending_clients) close_pending_client(pending_clients);
+    stop_active_streams();
     thread_pool_destroy(pool);
     close(epoll_fd);
     close(server_fd);

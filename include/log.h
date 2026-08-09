@@ -1,11 +1,12 @@
 /**
  * @file log.h
- * @brief Colored console logging with severity levels
+ * @brief Thread-safe, journald-friendly logging with severity levels
  * 
  * Provides macro-based logging with:
  * - Four severity levels: ERROR, WARN, INFO, DEBUG
  * - Automatic timestamps
- * - ANSI color coding for readability
+ * - Syslog priority prefixes understood by journald
+ * - Plain key/value fields without terminal escape sequences
  * - Verbose mode gating for DEBUG messages
  * 
  * Usage:
@@ -17,68 +18,59 @@
 #ifndef LOG_H
 #define LOG_H
 
+#include <stdarg.h>
 #include <stdio.h>
 #include <time.h>
 
 /** Log severity levels (ordered from most to least critical) */
 typedef enum {
-    LOG_ERROR,  /**< Critical errors that may cause failure */
-    LOG_WARN,   /**< Warning conditions */
-    LOG_INFO,   /**< Informational messages */
-    LOG_DEBUG   /**< Verbose debug output (requires -v flag) */
+    LOG_LEVEL_ERROR,
+    LOG_LEVEL_WARN,
+    LOG_LEVEL_INFO,
+    LOG_LEVEL_DEBUG
 } LogLevel;
 
 /** Global verbose flag - controls DEBUG output visibility */
 extern int g_verbose;
 
-/* ANSI color escape codes for terminal output */
-#define COLOR_RESET   "\033[0m"
-#define COLOR_RED     "\033[1;31m"   /* Errors */
-#define COLOR_YELLOW  "\033[1;33m"   /* Warnings */
-#define COLOR_GREEN   "\033[1;32m"   /* Info */
-#define COLOR_CYAN    "\033[1;36m"   /* Tags */
-#define COLOR_DIM     "\033[2m"      /* Debug/timestamps */
-
-/**
- * Format current time as HH:MM:SS into provided buffer (thread-safe)
- */
 static inline void log_timestamp(char *buf, size_t len) {
     time_t now = time(NULL);
     struct tm tm_buf;
-    localtime_r(&now, &tm_buf);
-    strftime(buf, len, "%H:%M:%S", &tm_buf);
+    gmtime_r(&now, &tm_buf);
+    strftime(buf, len, "%Y-%m-%dT%H:%M:%SZ", &tm_buf);
 }
 
-/**
- * Core logging macro - use convenience macros below instead
- */
-#define LOG(level, tag, fmt, ...) do { \
-    if ((level) == LOG_DEBUG && !g_verbose) break; \
-    char _ts[16]; log_timestamp(_ts, sizeof(_ts)); \
-    const char *_color = ""; \
-    const char *_prefix = ""; \
-    switch (level) { \
-        case LOG_ERROR: _color = COLOR_RED; _prefix = "ERROR"; break; \
-        case LOG_WARN:  _color = COLOR_YELLOW; _prefix = "WARN "; break; \
-        case LOG_INFO:  _color = COLOR_GREEN; _prefix = "INFO "; break; \
-        case LOG_DEBUG: _color = COLOR_DIM; _prefix = "DEBUG"; break; \
-    } \
-    fprintf(stderr, "%s[%s]%s %s%-5s%s %s" COLOR_CYAN "%s" COLOR_RESET " " fmt "\n", \
-        COLOR_DIM, _ts, COLOR_RESET, \
-        _color, _prefix, COLOR_RESET, \
-        _color, tag, ##__VA_ARGS__); \
-} while(0)
+static inline void log_write(LogLevel level, const char *component,
+                             const char *format, ...) {
+    if (level == LOG_LEVEL_DEBUG && !g_verbose) return;
+
+    static const char *names[] = {"ERROR", "WARN", "INFO", "DEBUG"};
+    static const int priorities[] = {3, 4, 6, 7};
+    char timestamp[32];
+    log_timestamp(timestamp, sizeof(timestamp));
+
+    flockfile(stderr);
+    fprintf(stderr, "<%d>timestamp=%s level=%s component=%s message=",
+            priorities[level], timestamp, names[level],
+            component ? component : "UNKNOWN");
+    va_list args;
+    va_start(args, format);
+    vfprintf(stderr, format, args);
+    va_end(args);
+    fputc('\n', stderr);
+    funlockfile(stderr);
+}
 
 /** Log an error message */
-#define LOG_ERROR(tag, fmt, ...) LOG(LOG_ERROR, tag, fmt, ##__VA_ARGS__)
+#define LOG_ERROR(tag, ...) log_write(LOG_LEVEL_ERROR, tag, __VA_ARGS__)
 
 /** Log a warning message */
-#define LOG_WARN(tag, fmt, ...)  LOG(LOG_WARN, tag, fmt, ##__VA_ARGS__)
+#define LOG_WARN(tag, ...)  log_write(LOG_LEVEL_WARN, tag, __VA_ARGS__)
 
 /** Log an informational message */
-#define LOG_INFO(tag, fmt, ...)  LOG(LOG_INFO, tag, fmt, ##__VA_ARGS__)
+#define LOG_INFO(tag, ...)  log_write(LOG_LEVEL_INFO, tag, __VA_ARGS__)
 
 /** Log a debug message (only visible with -v flag) */
-#define LOG_DEBUG(tag, fmt, ...) LOG(LOG_DEBUG, tag, fmt, ##__VA_ARGS__)
+#define LOG_DEBUG(tag, ...) log_write(LOG_LEVEL_DEBUG, tag, __VA_ARGS__)
 
 #endif

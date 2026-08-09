@@ -26,7 +26,10 @@ To prevent command truncation or buffer overflows, a "sticky error" pattern is u
 ### HTTP Server Hardening (`src/http_server.c`)
 -   **Buffered Reading**: Handles fragmented TCP packets robustly.
 -   **Size Limit**: Enforces a 4KB maximum for HTTP headers.
+-   **Header Deadline**: Incomplete requests expire after 10 seconds and pending header connections are capped.
+-   **Input Validation**: Methods, exact query names, codecs, backends, bitrates, and audio channel counts are validated before dispatch.
 -   **Deferred Response**: Waits for valid stream data before sending `200 OK`.
+-   **Bounded Pipelines**: Stream startup and later no-data stalls terminate after 15 seconds with bounded process-group cleanup.
 
 ### DVB Readiness (`src/tuner.c`)
 
@@ -42,6 +45,27 @@ To prevent command truncation or buffer overflows, a "sticky error" pattern is u
 -   No-lock multiplexes and multiplexes below 20 dB C/N are classified as weak.
 -   The interactive prompt can retain weak channels. The default comments every service block on a weak multiplex while preserving its measurements for review.
 -   Configuration replacement uses a temporary file, flushes it to disk, and atomically renames it over `channels.conf`.
+-   Scanner worker status and output are validated; an empty or failed scan never replaces the active configuration.
+-   Setup requires a TTY, so service startup cannot loop on end-of-file prompts.
+
+### Tuner Ownership and EPG Shutdown (`src/tuner.c`, `src/epg.c`)
+
+-   Every tuner acquisition receives a generation. A preempted EPG worker cannot release or overwrite the stream lease that replaced it.
+-   EPG child PIDs are accessed under the tuner mutex.
+-   The orchestrator is joinable, successfully created workers are tracked, and shutdown interrupts EPG children before joining all threads and closing SQLite.
+-   Complete SQLite reads and write transactions are serialized on the shared connection.
+-   PSIP sections are rejected when their declared length or MPEG-2 CRC is invalid, and transport continuity gaps reset partial section assembly.
+
+### Channel Identity (`src/channels.c`)
+
+-   Duplicate virtual channel numbers receive frequency/service-qualified identifiers shared by M3U, XMLTV, JSON, and stream lookup.
+-   Ambiguous bare channel numbers are rejected instead of selecting the first configuration entry.
+
+### Logging (`include/log.h`)
+
+-   Logs contain `timestamp`, `level`, `component`, and `message` fields on one line.
+-   Syslog priority prefixes let journald retain severity without a libsystemd dependency.
+-   Terminal color sequences are never emitted.
 
 ## 3. Verification
 -   **Passthrough Mode**: The production endpoint returned HTTP 200 and transferred the requested service using `dvbv5-zap -p` with FFmpeg stream copy.
@@ -49,3 +73,6 @@ To prevent command truncation or buffer overflows, a "sticky error" pattern is u
 -   **Process Tree**: Confirmed no `sh` processes in the hierarchy.
 -   **Startup Readiness**: Verified immediate discovery with two frontends and the bounded 30-second no-device timeout path.
 -   **Signal Filtering**: Verified both default exclusion and explicit retention against a 49-channel configuration; the filtered file loaded only active, uncommented services.
+-   **Regression Tests**: `make test` verifies duplicate IDs, stale tuner lease rejection, and simultaneous EPG database writers.
+-   **Noninteractive Scanner**: Closed stdin exits with status 1 and a structured error without modifying `channels.conf`.
+-   **Graceful Streaming Shutdown**: An active transport stream terminates and releases its tuner within one second of SIGTERM in the hardware integration check.

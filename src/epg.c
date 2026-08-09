@@ -21,7 +21,11 @@
 #include <sys/wait.h>
 #include <fcntl.h>
 #include <time.h>
-#include <ctype.h> 
+#include <ctype.h>
+#include <errno.h>
+#include <signal.h>
+#include <stdatomic.h>
+#include <stdint.h>
 #include "epg.h"
 #include "config.h"
 #include "log.h"
@@ -46,6 +50,8 @@ typedef struct {
     int len;                     /* Current accumulated length */
     int expected_len;            /* Total expected section length */
     int active;                  /* Whether we're mid-section */
+    int continuity_counter;
+    int have_continuity;
 } SectionBuffer;
 
 /**
@@ -95,12 +101,19 @@ static pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t queue_cond = PTHREAD_COND_INITIALIZER;
 
 /* EPG thread state */
-int epg_running = 0;
+static atomic_int epg_running = 0;
 int epg_skip_first = 0;
 static int epg_completed_cycles = 0;
 static pthread_mutex_t cycle_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t cycle_cond = PTHREAD_COND_INITIALIZER;
 static pthread_t worker_threads[MAX_TUNERS];
+static int worker_thread_count = 0;
+static pthread_t orchestrator_thread;
+static int orchestrator_started = 0;
+
+static int epg_is_running(void) {
+    return atomic_load_explicit(&epg_running, memory_order_acquire);
+}
 
 // -----------------------------------------------------------------------------
 // Buffer Management
@@ -137,10 +150,12 @@ void ctx_upsert(ScanContext *ctx, Program *p) {
     ctx->programs_found++;
 }
 
-void ctx_update_description(ScanContext *ctx, int event_id, const char *desc) {
+void ctx_update_description(ScanContext *ctx, int source_id, int event_id,
+                            const char *desc) {
     if (!ctx || !desc || !desc[0]) return;
     for (int i = 0; i < ctx->list.count; i++) {
-        if (ctx->list.programs[i].event_id == event_id) {
+        if (ctx->list.programs[i].source_id == source_id &&
+            ctx->list.programs[i].event_id == event_id) {
             strncpy(ctx->list.programs[i].description, desc, sizeof(ctx->list.programs[i].description) - 1);
             ctx->list.programs[i].description[sizeof(ctx->list.programs[i].description) - 1] = '\0';
             return;
@@ -152,12 +167,14 @@ void ctx_update_description(ScanContext *ctx, int event_id, const char *desc) {
 // Prototypes
 // -----------------------------------------------------------------------------
 
-void scan_mux(Tuner *t, ScanContext *ctx, const char *channel_number, const char *channel_name);
-void handle_section(ScanContext *ctx, int pid, unsigned char *section, int len);
+void scan_mux(Tuner *t, unsigned long lease_generation, ScanContext *ctx,
+              const char *channel_number, const char *channel_name);
+void handle_section(ScanContext *ctx, int pid, const unsigned char *section,
+                    int len);
 int parse_ts_chunk(ScanContext *ctx, const unsigned char *buf, size_t len);
-void parse_atsc_vct(ScanContext *ctx, unsigned char *section, int len);
-void parse_atsc_eit(ScanContext *ctx, unsigned char *section, int len);
-void parse_atsc_ett(ScanContext *ctx, unsigned char *section, int len);
+void parse_atsc_vct(ScanContext *ctx, const unsigned char *section, int len);
+void parse_atsc_eit(ScanContext *ctx, const unsigned char *section, int len);
+void parse_atsc_ett(ScanContext *ctx, const unsigned char *section, int len);
 
 // -----------------------------------------------------------------------------
 // Source Map Helpers 
@@ -207,9 +224,12 @@ int get_source_map(const char *freq, int source_id, char *result, size_t result_
 static void enqueue_mux(const char *freq, const char *name, const char *num) {
     pthread_mutex_lock(&queue_mutex);
     if (mux_queue_count < MAX_MUX_QUEUE) {
-        strcpy(mux_queue[mux_queue_tail].freq, freq);
-        strcpy(mux_queue[mux_queue_tail].name, name);
-        strcpy(mux_queue[mux_queue_tail].number, num);
+        snprintf(mux_queue[mux_queue_tail].freq,
+                 sizeof(mux_queue[mux_queue_tail].freq), "%s", freq);
+        snprintf(mux_queue[mux_queue_tail].name,
+                 sizeof(mux_queue[mux_queue_tail].name), "%s", name);
+        snprintf(mux_queue[mux_queue_tail].number,
+                 sizeof(mux_queue[mux_queue_tail].number), "%s", num);
         mux_queue_tail = (mux_queue_tail + 1) % MAX_MUX_QUEUE;
         mux_queue_count++;
         pthread_cond_signal(&queue_cond);
@@ -219,10 +239,10 @@ static void enqueue_mux(const char *freq, const char *name, const char *num) {
 
 int dequeue_mux(MuxJob *job) {
     pthread_mutex_lock(&queue_mutex);
-    while (mux_queue_count == 0 && epg_running) {
+    while (mux_queue_count == 0 && epg_is_running()) {
         pthread_cond_wait(&queue_cond, &queue_mutex);
     }
-    if (!epg_running) {
+    if (!epg_is_running()) {
         pthread_mutex_unlock(&queue_mutex);
         return 0;
     }
@@ -239,25 +259,34 @@ int dequeue_mux(MuxJob *job) {
 // -----------------------------------------------------------------------------
 
 void *scanner_worker(void *arg) {
-    free(arg);
-    while (epg_running) {
+    (void)arg;
+    while (epg_is_running()) {
         MuxJob job;
         if (!dequeue_mux(&job)) break;
 
-        Tuner *t = acquire_tuner(USER_EPG);
+        unsigned long lease_generation = 0;
+        Tuner *t = acquire_tuner(USER_EPG, &lease_generation);
         if (!t) {
             pthread_mutex_lock(&queue_mutex);
             active_scan_jobs--;
             pthread_mutex_unlock(&queue_mutex);
-            usleep(1000000);
-            enqueue_mux(job.freq, job.name, job.number);
+            for (int i = 0; i < 10 && epg_is_running(); i++) usleep(100000);
+            if (epg_is_running()) enqueue_mux(job.freq, job.name, job.number);
             continue;
         }
 
         ScanContext *ctx = calloc(1, sizeof(ScanContext));
+        if (!ctx) {
+            LOG_ERROR("EPG", "Unable to allocate scan context");
+            release_tuner(t, lease_generation);
+            pthread_mutex_lock(&queue_mutex);
+            active_scan_jobs--;
+            pthread_mutex_unlock(&queue_mutex);
+            continue;
+        }
         ctx->freq = job.freq;
         
-        scan_mux(t, ctx, job.number, job.name);
+        scan_mux(t, lease_generation, ctx, job.number, job.name);
         
         pthread_mutex_lock(&queue_mutex);
         active_scan_jobs--;
@@ -265,7 +294,7 @@ void *scanner_worker(void *arg) {
 
         if (ctx->list.programs) free(ctx->list.programs);
         free(ctx);
-        release_tuner(t);
+        release_tuner(t, lease_generation);
     }
     return NULL;
 }
@@ -281,12 +310,12 @@ void *epg_orchestrator(void *arg) {
         LOG_DEBUG("EPG", "Database has data, skipping initial scan cycle");
         fflush(stdout);
         for(int k=0; k<15*60; k++) {
-            if (!epg_running) break;
+            if (!epg_is_running()) break;
             sleep(1);
         }
     }
 
-    while (epg_running) {
+    while (epg_is_running()) {
         LOG_INFO("EPG", "Starting full scan cycle...");
         fflush(stdout);
         db_cleanup_expired();
@@ -307,7 +336,9 @@ void *epg_orchestrator(void *arg) {
                 }
             }
             if (already) continue;
-            strcpy(scanned_freqs[scanned_count++], c->frequency);
+            if (scanned_count >= MAX_CHANNELS) break;
+            snprintf(scanned_freqs[scanned_count++],
+                     sizeof(scanned_freqs[0]), "%s", c->frequency);
             enqueue_mux(c->frequency, c->name, c->number);
         }
 
@@ -317,7 +348,7 @@ void *epg_orchestrator(void *arg) {
             pthread_mutex_unlock(&queue_mutex);
             if (count == 0) break;
             sleep(1);
-            if (!epg_running) break;
+            if (!epg_is_running()) break;
         }
 
         LOG_INFO("EPG", "Scan cycle complete");
@@ -331,7 +362,7 @@ void *epg_orchestrator(void *arg) {
         LOG_DEBUG("EPG", "Sleeping 15 minutes...");
         fflush(stdout);
         for(int k=0; k<15*60; k++) {
-            if (!epg_running) break;
+            if (!epg_is_running()) break;
             sleep(1);
         }
     }
@@ -342,15 +373,27 @@ void wait_for_first_epg_scan() {
     LOG_INFO("EPG", "Waiting for first scan cycle to complete...");
     fflush(stdout);
     pthread_mutex_lock(&cycle_mutex);
-    while (epg_completed_cycles == 0 && epg_running) {
+    while (epg_completed_cycles == 0 && epg_is_running()) {
         pthread_cond_wait(&cycle_cond, &cycle_mutex);
     }
     pthread_mutex_unlock(&cycle_mutex);
 }
 
 void start_epg_thread() {
-    if (epg_running) return;
-    epg_running = 1;
+    if (tuner_count <= 0) {
+        LOG_WARN("EPG", "EPG engine not started because no tuners are available");
+        return;
+    }
+    if (atomic_exchange_explicit(&epg_running, 1, memory_order_acq_rel)) return;
+
+    pthread_mutex_lock(&queue_mutex);
+    mux_queue_head = 0;
+    mux_queue_tail = 0;
+    mux_queue_count = 0;
+    active_scan_jobs = 0;
+    pthread_mutex_unlock(&queue_mutex);
+    worker_thread_count = 0;
+    orchestrator_started = 0;
     
     if (db_has_data()) {
         epg_skip_first = 1;
@@ -361,22 +404,48 @@ void start_epg_thread() {
     }
 
     for (int i = 0; i < tuner_count; i++) {
-        int *id = malloc(sizeof(int));
-        *id = i;
-        pthread_create(&worker_threads[i], NULL, scanner_worker, id);
+        if (pthread_create(&worker_threads[worker_thread_count], NULL,
+                           scanner_worker, NULL) != 0) {
+            LOG_ERROR("EPG", "Failed to create scanner worker %d", i);
+            atomic_store_explicit(&epg_running, 0, memory_order_release);
+            pthread_cond_broadcast(&queue_cond);
+            for (int j = 0; j < worker_thread_count; j++) {
+                pthread_join(worker_threads[j], NULL);
+            }
+            worker_thread_count = 0;
+            return;
+        }
+        worker_thread_count++;
     }
     
-    pthread_t orch_tid;
-    pthread_create(&orch_tid, NULL, epg_orchestrator, NULL);
-    pthread_detach(orch_tid);
+    if (pthread_create(&orchestrator_thread, NULL, epg_orchestrator, NULL) != 0) {
+        LOG_ERROR("EPG", "Failed to create orchestrator thread");
+        atomic_store_explicit(&epg_running, 0, memory_order_release);
+        pthread_cond_broadcast(&queue_cond);
+        for (int i = 0; i < worker_thread_count; i++) {
+            pthread_join(worker_threads[i], NULL);
+        }
+        worker_thread_count = 0;
+        return;
+    }
+    orchestrator_started = 1;
 }
 
 void stop_epg_thread() {
-    epg_running = 0;
+    if (!atomic_exchange_explicit(&epg_running, 0, memory_order_acq_rel) &&
+        !orchestrator_started && worker_thread_count == 0) return;
+
+    cancel_tuner_users(USER_EPG);
     pthread_cond_broadcast(&queue_cond);
-    for (int i = 0; i < tuner_count; i++) {
+    pthread_cond_broadcast(&cycle_cond);
+    if (orchestrator_started) {
+        pthread_join(orchestrator_thread, NULL);
+        orchestrator_started = 0;
+    }
+    for (int i = 0; i < worker_thread_count; i++) {
         pthread_join(worker_threads[i], NULL);
     }
+    worker_thread_count = 0;
 }
 
 // -----------------------------------------------------------------------------
@@ -427,8 +496,23 @@ static void atsc_mss_to_string(const unsigned char *buf, int len, char *dest, si
     while (d_len > 0 && dest[d_len-1] == ' ') dest[--d_len] = '\0';
 }
 
-void handle_section(ScanContext *ctx, int pid, unsigned char *section, int len) {
-    if (len < 3) return;
+static int section_crc_valid(const unsigned char *section, int len) {
+    uint32_t crc = 0xFFFFFFFFU;
+    for (int i = 0; i < len; i++) {
+        crc ^= (uint32_t)section[i] << 24;
+        for (int bit = 0; bit < 8; bit++) {
+            crc = (crc & 0x80000000U) ? (crc << 1) ^ 0x04C11DB7U
+                                      : crc << 1;
+        }
+    }
+    return crc == 0;
+}
+
+void handle_section(ScanContext *ctx, int pid, const unsigned char *section,
+                    int len) {
+    if (len < 7) return;
+    int declared_length = (((section[1] & 0x0F) << 8) | section[2]) + 3;
+    if (declared_length != len || !section_crc_valid(section, len)) return;
     unsigned char table_id = section[0];
     
     int is_eit_pid = 0;
@@ -438,6 +522,7 @@ void handle_section(ScanContext *ctx, int pid, unsigned char *section, int len) 
     
     if (pid == 0x1FFB || is_eit_pid) {
         if (table_id == 0xC7) {
+            if (len < 11) return;
             int tables_defined = (section[9] << 8) | section[10];
             int loop_offset = 11;
             for(int i=0; i<tables_defined; i++) {
@@ -475,16 +560,17 @@ int parse_ts_chunk(ScanContext *ctx, const unsigned char *buf, size_t len) {
         int pusi = buf[i+1] & 0x40;
         int pid = ((buf[i+1] & 0x1F) << 8) | buf[i+2];
         int adap = (buf[i+3] >> 4) & 0x3;
+        if (adap == 0 || adap == 2) continue;
         int payload_offset = 4;
 
-        if (adap == 0x2 || adap == 0x3) {
+        if (adap == 0x3) {
             int adap_len = buf[i+4];
             payload_offset += adap_len + 1;
         }
 
         if (payload_offset >= TS_PACKET_SIZE) continue;
 
-        unsigned char *payload = (unsigned char*)buf + i + payload_offset;
+        const unsigned char *payload = buf + i + payload_offset;
         int payload_len = TS_PACKET_SIZE - payload_offset;
 
         int interesting = (pid == 0x1FFB);
@@ -495,47 +581,68 @@ int parse_ts_chunk(ScanContext *ctx, const unsigned char *buf, size_t len) {
         }
         if (!interesting) continue; 
 
+        SectionBuffer *section_buffer = &ctx->pid_buffers[pid];
+        int continuity_counter = buf[i+3] & 0x0F;
+        if (section_buffer->have_continuity) {
+            if (continuity_counter == section_buffer->continuity_counter) {
+                continue;
+            }
+            int expected = (section_buffer->continuity_counter + 1) & 0x0F;
+            if (continuity_counter != expected) section_buffer->active = 0;
+        }
+        section_buffer->continuity_counter = continuity_counter;
+        section_buffer->have_continuity = 1;
+
         if (pusi) {
             if (payload_len < 1) continue;
             int pointer = payload[0];
             payload++; payload_len--;
             
             if (pointer < payload_len) {
-                if (ctx->pid_buffers[pid].active) {
-                    if (ctx->pid_buffers[pid].len + pointer < 4096) {
-                        memcpy(ctx->pid_buffers[pid].buffer + ctx->pid_buffers[pid].len, payload, pointer);
-                        handle_section(ctx, pid, ctx->pid_buffers[pid].buffer, ctx->pid_buffers[pid].len + pointer);
+                if (section_buffer->active) {
+                    if (section_buffer->len + pointer <=
+                        (int)sizeof(section_buffer->buffer)) {
+                        memcpy(section_buffer->buffer + section_buffer->len,
+                               payload, (size_t)pointer);
+                        handle_section(ctx, pid, section_buffer->buffer,
+                                       section_buffer->len + pointer);
                     }
-                    ctx->pid_buffers[pid].active = 0;
+                    section_buffer->active = 0;
                 }
 
-                unsigned char *sec_start = payload + pointer;
+                const unsigned char *sec_start = payload + pointer;
                 int sec_rem = payload_len - pointer;
-                if (sec_rem >= 3) {
+                while (sec_rem >= 3 && sec_start[0] != 0xFF) {
                     int section_len = ((sec_start[1] & 0x0F) << 8) | sec_start[2];
                     int total_len = section_len + 3;
-                    
+                    if (total_len < 7 ||
+                        total_len > (int)sizeof(section_buffer->buffer)) break;
                     if (sec_rem >= total_len) {
                         handle_section(ctx, pid, sec_start, total_len);
+                        sec_start += total_len;
+                        sec_rem -= total_len;
                     } else {
-                        ctx->pid_buffers[pid].len = 0;
-                        memcpy(ctx->pid_buffers[pid].buffer, sec_start, sec_rem);
-                        ctx->pid_buffers[pid].len = sec_rem;
-                        ctx->pid_buffers[pid].expected_len = total_len;
-                        ctx->pid_buffers[pid].active = 1;
+                        memcpy(section_buffer->buffer, sec_start,
+                               (size_t)sec_rem);
+                        section_buffer->len = sec_rem;
+                        section_buffer->expected_len = total_len;
+                        section_buffer->active = 1;
+                        break;
                     }
                 }
             }
         } else {
-             if (ctx->pid_buffers[pid].active) {
-                 int needed = ctx->pid_buffers[pid].expected_len - ctx->pid_buffers[pid].len;
+             if (section_buffer->active) {
+                 int needed = section_buffer->expected_len - section_buffer->len;
                  int to_copy = (payload_len < needed) ? payload_len : needed;
-                 memcpy(ctx->pid_buffers[pid].buffer + ctx->pid_buffers[pid].len, payload, to_copy);
-                 ctx->pid_buffers[pid].len += to_copy;
+                 memcpy(section_buffer->buffer + section_buffer->len, payload,
+                        (size_t)to_copy);
+                 section_buffer->len += to_copy;
 
-                 if (ctx->pid_buffers[pid].len >= ctx->pid_buffers[pid].expected_len) {
-                     handle_section(ctx, pid, ctx->pid_buffers[pid].buffer, ctx->pid_buffers[pid].len);
-                     ctx->pid_buffers[pid].active = 0;
+                 if (section_buffer->len >= section_buffer->expected_len) {
+                     handle_section(ctx, pid, section_buffer->buffer,
+                                    section_buffer->len);
+                     section_buffer->active = 0;
                  }
              }
         }
@@ -544,7 +651,8 @@ int parse_ts_chunk(ScanContext *ctx, const unsigned char *buf, size_t len) {
     return packet_count;
 }
 
-void parse_atsc_vct(ScanContext *ctx, unsigned char *section, int len) {
+void parse_atsc_vct(ScanContext *ctx, const unsigned char *section, int len) {
+    if (len < 10) return;
     int num_channels = section[9];
     int offset = 10;
     
@@ -563,7 +671,8 @@ void parse_atsc_vct(ScanContext *ctx, unsigned char *section, int len) {
     }
 }
 
-void parse_atsc_eit(ScanContext *ctx, unsigned char *section, int len) {
+void parse_atsc_eit(ScanContext *ctx, const unsigned char *section, int len) {
+    if (len < 10) return;
     int source_id = (section[3] << 8) | section[4];
     int num_events = section[9];
     int offset = 10;
@@ -571,7 +680,7 @@ void parse_atsc_eit(ScanContext *ctx, unsigned char *section, int len) {
     char vct_chan[16];
     if (!get_source_map(ctx->freq, source_id, vct_chan, sizeof(vct_chan))) return;
     
-    Channel *ch = find_channel_by_number(vct_chan);
+    Channel *ch = find_channel_by_frequency_number(ctx->freq, vct_chan);
     if (!ch) return;
     
     const char *chan_num = ch->number;
@@ -604,11 +713,12 @@ void parse_atsc_eit(ScanContext *ctx, unsigned char *section, int len) {
 
         if (title[0] != '\0' && start_ms > 0) {
             Program p = {0};
-            strncpy(p.frequency, ctx->freq, sizeof(p.frequency)-1);
-            strncpy(p.channel_service_id, chan_num, sizeof(p.channel_service_id)-1);
+            snprintf(p.frequency, sizeof(p.frequency), "%s", ctx->freq);
+            snprintf(p.channel_service_id, sizeof(p.channel_service_id), "%s",
+                     chan_num);
             p.start_time = start_ms;
             p.end_time = end_ms;
-            strncpy(p.title, title, sizeof(p.title)-1);
+            snprintf(p.title, sizeof(p.title), "%s", title);
             p.event_id = event_id;
             p.source_id = source_id;
             p.description[0] = '\0';
@@ -624,10 +734,10 @@ void parse_atsc_eit(ScanContext *ctx, unsigned char *section, int len) {
     }
 }
 
-void parse_atsc_ett(ScanContext *ctx, unsigned char *section, int len) {
+void parse_atsc_ett(ScanContext *ctx, const unsigned char *section, int len) {
     if (len < 17) return;
-    // int source_id = (section[3] << 8) | section[4];
     unsigned int etm_id = (section[9] << 24) | (section[10] << 16) | (section[11] << 8) | section[12];
+    int source_id = (int)(etm_id >> 16);
     int event_id = (etm_id >> 2) & 0x3FFF;
     
     int section_length = ((section[1] & 0x0F) << 8) | section[2];
@@ -639,10 +749,13 @@ void parse_atsc_ett(ScanContext *ctx, unsigned char *section, int len) {
     char desc[1024] = {0};
     atsc_mss_to_string(section + mss_start, mss_len, desc, sizeof(desc));
     
-    if (desc[0] != '\0') ctx_update_description(ctx, event_id, desc);
+    if (desc[0] != '\0') {
+        ctx_update_description(ctx, source_id, event_id, desc);
+    }
 }
 
-void scan_mux(Tuner *t, ScanContext *ctx, const char *channel_number, const char *channel_name) {
+void scan_mux(Tuner *t, unsigned long lease_generation, ScanContext *ctx,
+              const char *channel_number, const char *channel_name) {
     int pipefd[2];
     if (pipe(pipefd) == -1) return;
     
@@ -667,7 +780,16 @@ void scan_mux(Tuner *t, ScanContext *ctx, const char *channel_number, const char
         execlp("dvbv5-zap", "dvbv5-zap", "-c", channels_conf_path, "-a", adapter_id, "-P", "-t", "45", "-o", "-", channel_number, NULL);
         _exit(1);
     } else if (pid > 0) {
-        t->zap_pid = pid;
+        if (!tuner_set_process(t, lease_generation, pid)) {
+            close(pipefd[0]);
+            close(pipefd[1]);
+            kill(pid, SIGTERM);
+            waitpid(pid, NULL, 0);
+            if (epg_is_running()) {
+                enqueue_mux(ctx->freq, channel_name, channel_number);
+            }
+            return;
+        }
         close(pipefd[1]);
 
         unsigned char buf[1024 * 32];
@@ -691,15 +813,22 @@ void scan_mux(Tuner *t, ScanContext *ctx, const char *channel_number, const char
             LOG_INFO("EPG", "Scan complete for %s %s: No (new) programs found", channel_name, channel_number);
         }
 
-        int status;
-        waitpid(pid, &status, 0);
-        t->zap_pid = 0;
+        int status = 0;
+        int status_valid = waitpid(pid, &status, 0) == pid;
+        int preempted = !tuner_lease_is_current(t, lease_generation);
+        tuner_clear_process(t, lease_generation, pid);
         
-        if (WIFSIGNALED(status)) {
+        if (preempted || (status_valid && WIFSIGNALED(status))) {
             LOG_DEBUG("EPG", "Scan of %s interrupted (likely preempted)", ctx->freq);
-            enqueue_mux(ctx->freq, channel_name, channel_number);
+            if (epg_is_running()) {
+                enqueue_mux(ctx->freq, channel_name, channel_number);
+            }
         }
 
         close(pipefd[0]);
+    } else {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        LOG_ERROR("EPG", "Failed to fork dvbv5-zap: %s", strerror(errno));
     }
 }

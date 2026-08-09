@@ -26,7 +26,7 @@ typedef enum {
 } TranscodeContainer;
 
 typedef struct {
-    char channel_num[16];
+    char channel_num[64];
     char input_file[256];
     TranscodeBackend backend;
     TranscodeCodec codec;

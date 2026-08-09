@@ -80,7 +80,10 @@ static int compare_channels(const void *a, const void *b) {
     sscanf(chb->number, "%d.%d", &b_major, &b_minor);
     
     if (a_major != b_major) return a_major - b_major;
-    return a_minor - b_minor;
+    if (a_minor != b_minor) return a_minor - b_minor;
+    int frequency_order = strcmp(cha->frequency, chb->frequency);
+    if (frequency_order != 0) return frequency_order;
+    return strcmp(cha->service_id, chb->service_id);
 }
 
 int load_channels(const char *filename) {
@@ -153,12 +156,44 @@ int load_channels(const char *filename) {
 
 Channel *find_channel_by_number(const char *number) {
     if (!number) return NULL;
+    Channel *match = NULL;
     for (int i = 0; i < channel_count; i++) {
         if (strcmp(channels[i].number, number) == 0) {
+            if (match) return NULL;
+            match = &channels[i];
+        }
+    }
+    return match;
+}
+
+Channel *find_channel_by_frequency_number(const char *frequency,
+                                          const char *number) {
+    if (!frequency || !number) return NULL;
+    for (int i = 0; i < channel_count; i++) {
+        if (strcmp(channels[i].frequency, frequency) == 0 &&
+            strcmp(channels[i].number, number) == 0) {
             return &channels[i];
         }
     }
     return NULL;
+}
+
+Channel *find_channel_by_id(const char *id) {
+    if (!id) return NULL;
+
+    for (int i = 0; i < channel_count; i++) {
+        char unique_id[128];
+        get_unique_channel_id(&channels[i], unique_id, sizeof(unique_id));
+        if (strcmp(unique_id, id) == 0) return &channels[i];
+    }
+
+    Channel *match = NULL;
+    for (int i = 0; i < channel_count; i++) {
+        if (strcmp(channels[i].number, id) != 0) continue;
+        if (match) return NULL;
+        match = &channels[i];
+    }
+    return match;
 }
 
 Channel *find_channel_by_freq_sid(const char *freq, int service_id) {
@@ -178,15 +213,11 @@ Channel *find_channel_by_freq_sid(const char *freq, int service_id) {
 // Check if a virtual channel number exists on multiple frequencies
 int is_vcn_duplicated(const char *number) {
     if (!number) return 0;
-    const char *first_freq = NULL;
+    int matches = 0;
     
     for (int i = 0; i < channel_count; i++) {
         if (strcmp(channels[i].number, number) == 0) {
-            if (!first_freq) {
-                first_freq = channels[i].frequency;
-            } else if (strcmp(channels[i].frequency, first_freq) != 0) {
-                return 1; // Found same VCN on different frequency
-            }
+            if (++matches > 1) return 1;
         }
     }
     return 0;
@@ -234,18 +265,15 @@ Channel *find_channel_fast(const char *freq, const char *svc_id) {
 }
 
 // Get unique channel ID for a channel (Thread-safe)
-const char *get_unique_channel_id(Channel *ch, char *buf, size_t len) {
+const char *get_unique_channel_id(const Channel *ch, char *buf, size_t len) {
     if (!ch || !buf || len == 0) return "";
     
     if (is_vcn_duplicated(ch->number)) {
-        // Extract first 3 significant digits from frequency for disambiguation
-        long freq = atol(ch->frequency);
-        int prefix = (int)(freq / 1000000); // MHz value
-        snprintf(buf, len, "%s-%d", ch->number, prefix);
+        snprintf(buf, len, "%s-%s-%s", ch->number, ch->frequency,
+                 ch->service_id);
     } else {
         snprintf(buf, len, "%s", ch->number);
     }
     
     return buf;
 }
-

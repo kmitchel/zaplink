@@ -137,6 +137,7 @@ void discover_tuners() {
                 tuners[tuner_count].in_use = 0;
                 tuners[tuner_count].zap_pid = 0;
                 tuners[tuner_count].user_type = USER_NONE;
+                tuners[tuner_count].generation = 0;
                 tuner_count++;
             }
         }
@@ -171,7 +172,14 @@ static void terminate_process(pid_t pid) {
     waitpid(pid, &status, 0); // Reap the zombie
 }
 
-Tuner *acquire_tuner(TunerUser purpose) {
+static unsigned long next_generation(Tuner *t) {
+    t->generation++;
+    if (t->generation == 0) t->generation++;
+    return t->generation;
+}
+
+Tuner *acquire_tuner(TunerUser purpose, unsigned long *lease_generation) {
+    if (!lease_generation) return NULL;
     pthread_mutex_lock(&tuner_mutex);
     
     if (tuner_count == 0) {
@@ -185,6 +193,7 @@ Tuner *acquire_tuner(TunerUser purpose) {
         if (!tuners[idx].in_use) {
             tuners[idx].in_use = 1;
             tuners[idx].user_type = purpose;
+            *lease_generation = next_generation(&tuners[idx]);
             last_tuner_index = idx;
             pthread_mutex_unlock(&tuner_mutex);
             return &tuners[idx];
@@ -207,6 +216,7 @@ Tuner *acquire_tuner(TunerUser purpose) {
                 
                 // Keep in_use=1 but change type
                 tuners[idx].user_type = USER_STREAM;
+                *lease_generation = next_generation(&tuners[idx]);
                 last_tuner_index = idx;
                 
                 pthread_mutex_unlock(&tuner_mutex);
@@ -219,12 +229,59 @@ Tuner *acquire_tuner(TunerUser purpose) {
     return NULL;
 }
 
-void release_tuner(Tuner *t) {
+int tuner_set_process(Tuner *t, unsigned long lease_generation, pid_t pid) {
+    if (!t || pid <= 0) return 0;
+
+    pthread_mutex_lock(&tuner_mutex);
+    int current = t->in_use && t->generation == lease_generation;
+    if (current) t->zap_pid = pid;
+    pthread_mutex_unlock(&tuner_mutex);
+    return current;
+}
+
+void tuner_clear_process(Tuner *t, unsigned long lease_generation, pid_t pid) {
+    if (!t) return;
+
+    pthread_mutex_lock(&tuner_mutex);
+    if (t->in_use && t->generation == lease_generation &&
+        (pid <= 0 || t->zap_pid == pid)) {
+        t->zap_pid = 0;
+    }
+    pthread_mutex_unlock(&tuner_mutex);
+}
+
+int tuner_lease_is_current(Tuner *t, unsigned long lease_generation) {
+    if (!t) return 0;
+    pthread_mutex_lock(&tuner_mutex);
+    int current = t->in_use && t->generation == lease_generation;
+    pthread_mutex_unlock(&tuner_mutex);
+    return current;
+}
+
+void cancel_tuner_users(TunerUser purpose) {
+    pthread_mutex_lock(&tuner_mutex);
+    for (int i = 0; i < tuner_count; i++) {
+        if (tuners[i].in_use && tuners[i].user_type == purpose &&
+            tuners[i].zap_pid > 0) {
+            terminate_process(tuners[i].zap_pid);
+            tuners[i].zap_pid = 0;
+        }
+    }
+    pthread_mutex_unlock(&tuner_mutex);
+}
+
+void release_tuner(Tuner *t, unsigned long lease_generation) {
     if (!t) return;
     
     pthread_mutex_lock(&tuner_mutex);
     
-    // Terminate child processes and wait to prevent zombies
+    if (!t->in_use || t->generation != lease_generation) {
+        pthread_mutex_unlock(&tuner_mutex);
+        LOG_DEBUG("TUNER", "Ignoring stale lease release for tuner %d", t->id);
+        return;
+    }
+
+    // Terminate child processes and wait to prevent zombies.
     if (t->zap_pid > 0) {
         terminate_process(t->zap_pid);
         t->zap_pid = 0;
@@ -232,6 +289,7 @@ void release_tuner(Tuner *t) {
     
     t->in_use = 0;
     t->user_type = USER_NONE;
+    next_generation(t);
     
     pthread_mutex_unlock(&tuner_mutex);
 }

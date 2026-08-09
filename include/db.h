@@ -78,8 +78,4 @@ typedef struct {
 void db_bulk_upsert(ProgramList *list);
 void db_invalidate_cache();
 
-// Transaction control (still useful for manual batches if needed)
-void db_begin_transaction();
-void db_commit_transaction();
-
 #endif /* DB_H */

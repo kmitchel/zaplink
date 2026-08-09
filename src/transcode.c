@@ -12,6 +12,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
+#include <time.h>
 #include "transcode.h"
 #include "log.h"
 #include "config.h"
@@ -36,19 +37,57 @@ TranscodeCodec parse_codec(const char *name) {
     return CODEC_INVALID;
 }
 
+static int write_all(int fd, const char *buf, size_t len);
+
 /**
  * Validate channel number format to prevent shell injection.
  * Only allows digits, dots, and hyphens (e.g., "15.1", "21-1", "33.2").
  * Returns 1 if valid, 0 if invalid.
  */
-static int validate_channel_num(const char *s) {
+static int validate_channel_id(const char *s) {
     if (!s || !*s) return 0;
     for (const char *p = s; *p; p++) {
-        if (!isdigit(*p) && *p != '.' && *p != '-') {
+        if (!isdigit((unsigned char)*p) && *p != '.' && *p != '-') {
             return 0;
         }
     }
     return 1;
+}
+
+static void send_stream_error(int fd, const char *status, const char *message) {
+    char header[512];
+    size_t length = strlen(message);
+    int header_length = snprintf(
+        header, sizeof(header),
+        "HTTP/1.1 %s\r\nContent-Type: text/plain\r\nContent-Length: %zu\r\n"
+        "Connection: close\r\n\r\n",
+        status, length);
+    if (header_length > 0 && (size_t)header_length < sizeof(header)) {
+        write_all(fd, header, (size_t)header_length);
+        write_all(fd, message, length);
+    }
+}
+
+static time_t monotonic_seconds(void) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0;
+    return now.tv_sec;
+}
+
+static void terminate_process_group(pid_t pid, int *reaped) {
+    if (pid <= 0) return;
+    kill(-pid, SIGTERM);
+    int status;
+    for (int i = 0; i < 20; i++) {
+        pid_t result = waitpid(pid, &status, WNOHANG);
+        if (result == pid || (result < 0 && errno == ECHILD)) {
+            if (reaped) *reaped = 1;
+            return;
+        }
+        usleep(50000);
+    }
+    kill(-pid, SIGKILL);
+    if (waitpid(pid, &status, 0) == pid && reaped) *reaped = 1;
 }
 
 /**
@@ -87,20 +126,24 @@ static void add_arg(char **argv, int *argc, const char *arg, int *err) {
 
 void handle_unified_stream(int sockfd, StreamConfig *config, const char *http_header) {
     // SECURITY: Validate channel_num to prevent shell injection
-    if (!validate_channel_num(config->channel_num)) {
+    if (!validate_channel_id(config->channel_num)) {
         LOG_WARN("TRANSCODE", "Invalid channel number format: %s", config->channel_num);
+        send_stream_error(sockfd, "400 Bad Request", "Invalid channel identifier");
         return;
     }
 
-    Channel *c = find_channel_by_number(config->channel_num);
+    Channel *c = find_channel_by_id(config->channel_num);
     if (!c) {
         LOG_WARN("TRANSCODE", "Channel not found: %s", config->channel_num);
+        send_stream_error(sockfd, "404 Not Found", "Channel not found or identifier is ambiguous");
         return;
     }
 
-    Tuner *t = acquire_tuner(USER_STREAM);
+    unsigned long lease_generation = 0;
+    Tuner *t = acquire_tuner(USER_STREAM, &lease_generation);
     if (!t) {
         LOG_WARN("TRANSCODE", "No tuner available for stream");
+        send_stream_error(sockfd, "503 Service Unavailable", "No tuner available");
         return;
     }
 
@@ -114,7 +157,8 @@ void handle_unified_stream(int sockfd, StreamConfig *config, const char *http_he
     int zap_pipe[2];
     if (pipe(zap_pipe) < 0) {
         LOG_ERROR("TRANSCODE", "Failed to create zap pipe");
-        release_tuner(t);
+        send_stream_error(sockfd, "500 Internal Server Error", "Unable to create stream pipeline");
+        release_tuner(t, lease_generation);
         return;
     }
     
@@ -124,7 +168,8 @@ void handle_unified_stream(int sockfd, StreamConfig *config, const char *http_he
         LOG_ERROR("TRANSCODE", "Failed to create output pipe");
         close(zap_pipe[0]);
         close(zap_pipe[1]);
-        release_tuner(t);
+        send_stream_error(sockfd, "500 Internal Server Error", "Unable to create stream pipeline");
+        release_tuner(t, lease_generation);
         return;
     }
 
@@ -136,8 +181,14 @@ void handle_unified_stream(int sockfd, StreamConfig *config, const char *http_he
         close(zap_pipe[1]);
         close(pipefds[0]);
         close(pipefds[1]);
-        release_tuner(t);
+        send_stream_error(sockfd, "500 Internal Server Error", "Unable to start stream pipeline");
+        release_tuner(t, lease_generation);
         return;
+    }
+
+    if (pid > 0 && setpgid(pid, pid) < 0 && errno != EACCES && errno != ESRCH) {
+        LOG_WARN("TRANSCODE", "Parent setpgid failed for %d: %s", pid,
+                 strerror(errno));
     }
     
     if (pid == 0) {
@@ -188,6 +239,8 @@ void handle_unified_stream(int sockfd, StreamConfig *config, const char *http_he
         }
         
         // Fork ffmpeg
+        if (zap_pid < 0) _exit(1);
+
         pid_t ffmpeg_pid = fork();
         if (ffmpeg_pid == 0) {
             // ffmpeg process
@@ -376,6 +429,12 @@ void handle_unified_stream(int sockfd, StreamConfig *config, const char *http_he
             _exit(1);
         }
         
+        if (ffmpeg_pid < 0) {
+            kill(zap_pid, SIGTERM);
+            waitpid(zap_pid, NULL, 0);
+            _exit(1);
+        }
+
         // Parent of zap/ffmpeg (Stream Group Leader)
         close(zap_pipe[0]);
         close(zap_pipe[1]);
@@ -426,16 +485,39 @@ void handle_unified_stream(int sockfd, StreamConfig *config, const char *http_he
     char buffer[65536];
     ssize_t n;
     int header_sent = 0;
+    int child_reaped = 0;
+    time_t stream_started = monotonic_seconds();
+    time_t last_data = stream_started;
     
     while (1) {
-        // Poll with 5 second timeout to periodically check socket health
-        int ret = poll(fds, 2, 5000);
+        int ret = poll(fds, 2, 1000);
 
         if (ret == 0) {
-            // Timeout (5s)
-            LOG_WARN("TRANSCODE", "Stream Stall: No data received from tuner/ffmpeg for 5s");
-            // Check if process is still alive? 
-            // For now just warn, maybe client will disconnect.
+            int status;
+            pid_t child_state = waitpid(pid, &status, WNOHANG);
+            if (child_state == pid) {
+                child_reaped = 1;
+                if (!header_sent) {
+                    send_stream_error(sockfd, "502 Bad Gateway",
+                                      "Stream pipeline exited before producing data");
+                }
+                break;
+            }
+
+            time_t now = monotonic_seconds();
+            int timeout = header_sent ? STREAM_STALL_TIMEOUT_SECONDS
+                                      : STREAM_START_TIMEOUT_SECONDS;
+            time_t reference = header_sent ? last_data : stream_started;
+            if (now > 0 && reference > 0 && now - reference >= timeout) {
+                LOG_WARN("TRANSCODE", "%s timeout after %d seconds for %s",
+                         header_sent ? "Stream stall" : "Stream startup",
+                         timeout, config->channel_num);
+                if (!header_sent) {
+                    send_stream_error(sockfd, "504 Gateway Timeout",
+                                      "Timed out waiting for broadcast data");
+                }
+                break;
+            }
             continue;
         }
 
@@ -458,6 +540,7 @@ void handle_unified_stream(int sockfd, StreamConfig *config, const char *http_he
                 if (n < 0 && errno == EINTR) continue;
                 break;  // EOF or error
             }
+            last_data = monotonic_seconds();
             
             // Send HTTP header on first data chunk (deferred response)
             if (!header_sent) {
@@ -478,19 +561,23 @@ void handle_unified_stream(int sockfd, StreamConfig *config, const char *http_he
         if (fds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) {
             // Drain any remaining data
             while ((n = read(pipefds[0], buffer, sizeof(buffer))) > 0) {
+                if (!header_sent) {
+                    if (!write_all(sockfd, http_header, strlen(http_header))) break;
+                    header_sent = 1;
+                }
                 if (!write_all(sockfd, buffer, n)) break;
+            }
+            if (!header_sent) {
+                send_stream_error(sockfd, "502 Bad Gateway",
+                                  "Stream pipeline produced no data");
             }
             break;
         }
     }
 
-    // Kill the entire process group (negative PID)
-    kill(-pid, SIGTERM);
-    
     // Cleanup
     close(pipefds[0]);
-    int status;
-    waitpid(pid, &status, 0);
-    release_tuner(t);
+    if (!child_reaped) terminate_process_group(pid, &child_reaped);
+    release_tuner(t, lease_generation);
     LOG_INFO("TRANSCODE", "Stream ended for %s", config->channel_num);
 }

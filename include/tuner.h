@@ -11,6 +11,7 @@
 #define TUNER_H
 
 #include <sys/types.h>
+#include "config.h"
 
 /**
  * Purpose for which a tuner is being used
@@ -31,10 +32,11 @@ typedef struct {
     int in_use;          /**< Whether tuner is currently acquired */
     pid_t zap_pid;       /**< PID of dvbv5-zap process using this tuner */
     TunerUser user_type; /**< Current usage type */
+    unsigned long generation; /**< Incremented whenever ownership changes */
 } Tuner;
 
 /** Array of discovered tuners */
-extern Tuner tuners[16];
+extern Tuner tuners[MAX_TUNERS];
 
 /** Number of tuners discovered */
 extern int tuner_count;
@@ -63,13 +65,25 @@ void discover_tuners();
  * @param purpose The intended use for the tuner
  * @return Pointer to acquired Tuner, or NULL if none available
  */
-Tuner *acquire_tuner(TunerUser purpose);
+Tuner *acquire_tuner(TunerUser purpose, unsigned long *lease_generation);
+
+/** Register a child process only if the lease still owns the tuner. */
+int tuner_set_process(Tuner *t, unsigned long lease_generation, pid_t pid);
+
+/** Clear a registered process only if the lease still owns the tuner. */
+void tuner_clear_process(Tuner *t, unsigned long lease_generation, pid_t pid);
+
+/** Return whether a lease still owns its tuner. */
+int tuner_lease_is_current(Tuner *t, unsigned long lease_generation);
+
+/** Interrupt processes currently owned by the specified user type. */
+void cancel_tuner_users(TunerUser purpose);
 
 /**
  * Release a tuner back to the pool
  * Terminates any child processes (zap) and marks tuner as available
  * @param t Pointer to tuner to release
  */
-void release_tuner(Tuner *t);
+void release_tuner(Tuner *t, unsigned long lease_generation);
 
 #endif

@@ -47,9 +47,16 @@ int load_channels(const char *filename);
 /**
  * Find a channel by its virtual channel number
  * @param number Virtual channel number (e.g., "15.1")
- * @return Pointer to Channel, or NULL if not found
+ * @return Pointer to Channel, or NULL if not found or ambiguous
  */
 Channel *find_channel_by_number(const char *number);
+
+/** Resolve a public, collision-free playlist/stream channel identifier. */
+Channel *find_channel_by_id(const char *id);
+
+/** Find a virtual channel on a specific multiplex. */
+Channel *find_channel_by_frequency_number(const char *frequency,
+                                          const char *number);
 
 /**
  * Find a channel by frequency and service ID
@@ -90,6 +97,6 @@ Channel *find_channel_fast(const char *freq, const char *svc_id);
  * @param len Size of output buffer
  * @return Pointer to buf (or empty string on error)
  */
-const char *get_unique_channel_id(Channel *ch, char *buf, size_t len);
+const char *get_unique_channel_id(const Channel *ch, char *buf, size_t len);
 
 #endif

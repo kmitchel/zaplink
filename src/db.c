@@ -43,11 +43,14 @@ static pthread_mutex_t g_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
 void build_channel_lookup();
 
 int db_init() {
-    int rc = sqlite3_open(DB_PATH, &db);
+    int rc = sqlite3_open_v2(DB_PATH, &db,
+                             SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE |
+                             SQLITE_OPEN_FULLMUTEX, NULL);
     if (rc) {
-        fprintf(stderr, "Can't open database: %s\n", sqlite3_errmsg(db));
+        LOG_ERROR("DB", "Cannot open database: %s", sqlite3_errmsg(db));
         return 0;
     }
+    sqlite3_busy_timeout(db, 5000);
     
     // Create Table if not exists
     char *sql = "CREATE TABLE IF NOT EXISTS programs ("
@@ -64,7 +67,7 @@ int db_init() {
     char *err_msg = 0;
     rc = sqlite3_exec(db, sql, 0, 0, &err_msg);
     if (rc != SQLITE_OK) {
-        fprintf(stderr, "SQL error: %s\n", err_msg);
+        LOG_ERROR("DB", "Schema creation failed: %s", err_msg);
         sqlite3_free(err_msg);
         return 0;
     }
@@ -75,7 +78,7 @@ int db_init() {
                     "CREATE INDEX IF NOT EXISTS idx_programs_channel ON programs(channel_service_id);";
     rc = sqlite3_exec(db, sql_idx, 0, 0, &err_msg);
     if (rc != SQLITE_OK) {
-        fprintf(stderr, "SQL error creating indexes: %s\n", err_msg);
+        LOG_ERROR("DB", "Index creation failed: %s", err_msg);
         sqlite3_free(err_msg);
     }
     
@@ -86,6 +89,10 @@ void db_close() {
     pthread_mutex_lock(&db_stmt_mutex);
     if (stmt_upsert) { sqlite3_finalize(stmt_upsert); stmt_upsert = NULL; }
     if (stmt_update_desc) { sqlite3_finalize(stmt_update_desc); stmt_update_desc = NULL; }
+    if (db) {
+        sqlite3_close(db);
+        db = NULL;
+    }
     pthread_mutex_unlock(&db_stmt_mutex);
 
     pthread_mutex_lock(&g_cache_mutex);
@@ -93,30 +100,11 @@ void db_close() {
     if (g_json_cache) { free(g_json_cache); g_json_cache = NULL; }
     pthread_mutex_unlock(&g_cache_mutex);
 
-    if (db) sqlite3_close(db);
-}
-
-// Transaction control
-void db_begin_transaction() {
-    if (!db) return;
-    char *err = NULL;
-    if (sqlite3_exec(db, "BEGIN TRANSACTION;", 0, 0, &err) != SQLITE_OK) {
-        LOG_WARN("DB", "Failed to begin transaction: %s", err);
-        sqlite3_free(err);
-    }
-}
-
-void db_commit_transaction() {
-    if (!db) return;
-    char *err = NULL;
-    if (sqlite3_exec(db, "COMMIT;", 0, 0, &err) != SQLITE_OK) {
-        LOG_WARN("DB", "Failed to commit transaction: %s", err);
-        sqlite3_free(err);
-    }
 }
 
 int db_has_data() {
     if (!db) return 0;
+    pthread_mutex_lock(&db_stmt_mutex);
     const char *sql = "SELECT COUNT(*) FROM programs;";
     sqlite3_stmt *stmt;
     int has_data = 0;
@@ -128,6 +116,7 @@ int db_has_data() {
         }
         sqlite3_finalize(stmt);
     }
+    pthread_mutex_unlock(&db_stmt_mutex);
     return has_data;
 }
 
@@ -180,6 +169,7 @@ static int xml_escape_append(char **dest, size_t *size, size_t *cap, const char 
 
 char *db_get_xmltv_programs() {
     if (!db) return NULL;
+    sqlite3_stmt *stmt = NULL;
 
     pthread_mutex_lock(&g_cache_mutex);
     struct timespec ts;
@@ -193,6 +183,8 @@ char *db_get_xmltv_programs() {
         return copy;
     }
     pthread_mutex_unlock(&g_cache_mutex);
+
+    pthread_mutex_lock(&db_stmt_mutex);
 
     // Regenerate
     int row_count = 0;
@@ -209,13 +201,16 @@ char *db_get_xmltv_programs() {
     size_t cap = (row_count > 0) ? (row_count * 600 + 4096) : (64 * 1024);
     size_t size = 0;
     char *xml = malloc(cap);
-    if (!xml) return NULL;
+    if (!xml) {
+        pthread_mutex_unlock(&db_stmt_mutex);
+        return NULL;
+    }
     xml[0] = '\0';
 
     APPEND_OR_FAIL(append_str(&xml, &size, &cap, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE tv SYSTEM \"xmltv.dtd\">\n<tv generator-info-name=\"ZapLink\">\n"));
 
     for (int i = 0; i < channel_count; i++) {
-        char unique_id[64];
+        char unique_id[128];
         get_unique_channel_id(&channels[i], unique_id, sizeof(unique_id));
         char buf[256];
         snprintf(buf, sizeof(buf), "  <channel id=\"%s\">\n    <display-name>", unique_id);
@@ -224,7 +219,6 @@ char *db_get_xmltv_programs() {
         APPEND_OR_FAIL(append_str(&xml, &size, &cap, "</display-name>\n  </channel>\n"));
     }
 
-    sqlite3_stmt *stmt;
     const char *sql = "SELECT title, description, start_time, end_time, channel_service_id, frequency, event_id, "
                       "(SELECT COUNT(*) FROM programs p2 WHERE p2.title = programs.title) as title_count "
                       "FROM programs "
@@ -234,6 +228,7 @@ char *db_get_xmltv_programs() {
     int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
     if (rc != SQLITE_OK) {
         free(xml);
+        pthread_mutex_unlock(&db_stmt_mutex);
         return NULL;
     }
 
@@ -252,7 +247,7 @@ char *db_get_xmltv_programs() {
         if (freq && svc_id) {
             ch = find_channel_fast(freq, svc_id);
         }
-        char id_buf[64];
+        char id_buf[128];
         const char *channel_id = "";
         if (ch) {
             channel_id = get_unique_channel_id(ch, id_buf, sizeof(id_buf));
@@ -298,6 +293,7 @@ char *db_get_xmltv_programs() {
     APPEND_OR_FAIL(append_str(&xml, &size, &cap, "</tv>"));
     
     sqlite3_finalize(stmt);
+    pthread_mutex_unlock(&db_stmt_mutex);
 
     // Update Cache
     pthread_mutex_lock(&g_cache_mutex);
@@ -311,6 +307,7 @@ char *db_get_xmltv_programs() {
 oom_fail:
     free(xml);
     sqlite3_finalize(stmt);
+    pthread_mutex_unlock(&db_stmt_mutex);
     LOG_ERROR("DB", "OOM while generating XMLTV");
     return NULL;
 }
@@ -344,10 +341,11 @@ static int json_escape_append(char **dest, size_t *size, size_t *cap, const char
 
 char *db_get_json_programs() {
     if (!db) return NULL;
+    pthread_mutex_lock(&db_stmt_mutex);
     
     // (Optional: Implement JSON caching here too if needed, but skipped for now as per plan/task)
 
-    const char *sql = "SELECT title, description, start_time, end_time, channel_service_id FROM programs "
+    const char *sql = "SELECT title, description, start_time, end_time, channel_service_id, frequency FROM programs "
                 "WHERE end_time > ? "
                 "ORDER BY CAST(channel_service_id AS INTEGER), "
                 "CASE WHEN INSTR(channel_service_id, '.') > 0 THEN CAST(SUBSTR(channel_service_id, INSTR(channel_service_id, '.') + 1) AS INTEGER) ELSE 0 END, "
@@ -358,6 +356,7 @@ char *db_get_json_programs() {
     
     if (rc != SQLITE_OK) {
         LOG_ERROR("DB", "Failed to fetch data: %s", sqlite3_errmsg(db));
+        pthread_mutex_unlock(&db_stmt_mutex);
         return NULL;
     }
 
@@ -369,14 +368,21 @@ char *db_get_json_programs() {
     size_t cap = 1024 * 1024;
     size_t size = 0;
     char *json = malloc(cap);
-    if (!json) { sqlite3_finalize(stmt); return NULL; }
+    if (!json) {
+        sqlite3_finalize(stmt);
+        pthread_mutex_unlock(&db_stmt_mutex);
+        return NULL;
+    }
     json[0] = '\0';
 
     APPEND_OR_FAIL(append_str(&json, &size, &cap, "{\n  \"channels\": [\n"));
 
     for (int i = 0; i < channel_count; i++) {
         char buf[256];
-        snprintf(buf, sizeof(buf), "    {\"id\": \"%s\", \"name\": \"", channels[i].number);
+        char channel_id[128];
+        get_unique_channel_id(&channels[i], channel_id, sizeof(channel_id));
+        snprintf(buf, sizeof(buf), "    {\"id\": \"%s\", \"name\": \"",
+                 channel_id);
         APPEND_OR_FAIL(append_str(&json, &size, &cap, buf));
         APPEND_OR_FAIL(json_escape_append(&json, &size, &cap, channels[i].name));
         APPEND_OR_FAIL(append_str(&json, &size, &cap, "\"}"));
@@ -393,13 +399,18 @@ char *db_get_json_programs() {
         long long start = sqlite3_column_int64(stmt, 2);
         long long end = sqlite3_column_int64(stmt, 3);
         const char *svc_id = (const char *)sqlite3_column_text(stmt, 4);
+        const char *freq = (const char *)sqlite3_column_text(stmt, 5);
+        char channel_id[128];
+        Channel *channel = (freq && svc_id) ? find_channel_fast(freq, svc_id) : NULL;
+        if (channel) get_unique_channel_id(channel, channel_id, sizeof(channel_id));
+        else snprintf(channel_id, sizeof(channel_id), "%s", svc_id ? svc_id : "");
 
         if (!first) APPEND_OR_FAIL(append_str(&json, &size, &cap, ",\n"));
         first = 0;
 
         char buf[256];
         snprintf(buf, sizeof(buf), "    {\"channel\": \"%s\", \"start\": %lld, \"end\": %lld, \"title\": \"",
-            svc_id ? svc_id : "", start, end);
+            channel_id, start, end);
         APPEND_OR_FAIL(append_str(&json, &size, &cap, buf));
         APPEND_OR_FAIL(json_escape_append(&json, &size, &cap, title));
         APPEND_OR_FAIL(append_str(&json, &size, &cap, "\", \"description\": \""));
@@ -410,11 +421,13 @@ char *db_get_json_programs() {
     APPEND_OR_FAIL(append_str(&json, &size, &cap, "\n  ]\n}"));
     
     sqlite3_finalize(stmt);
+    pthread_mutex_unlock(&db_stmt_mutex);
     return json;
 
 oom_fail:
     free(json);
     sqlite3_finalize(stmt);
+    pthread_mutex_unlock(&db_stmt_mutex);
     LOG_ERROR("DB", "OOM while generating JSON");
     return NULL;
 }
@@ -423,21 +436,31 @@ oom_fail:
 void db_bulk_upsert(ProgramList *list) {
     if (!db || !list || !list->programs || list->count == 0) return;
 
-    db_begin_transaction();
-    
     pthread_mutex_lock(&db_stmt_mutex);
+    char *transaction_error = NULL;
+    if (sqlite3_exec(db, "BEGIN IMMEDIATE;", NULL, NULL,
+                     &transaction_error) != SQLITE_OK) {
+        LOG_ERROR("DB", "Failed to begin EPG transaction: %s",
+                  transaction_error ? transaction_error : sqlite3_errmsg(db));
+        sqlite3_free(transaction_error);
+        pthread_mutex_unlock(&db_stmt_mutex);
+        return;
+    }
+    int transaction_ok = 1;
     
     // Prepare statement if needed
     if (!stmt_upsert) {
         char *sql = "INSERT INTO programs (frequency, channel_service_id, start_time, end_time, title, description, event_id, source_id) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
                     "ON CONFLICT(frequency, channel_service_id, start_time) "
-                    "DO UPDATE SET title=excluded.title, end_time=excluded.end_time, event_id=excluded.event_id, source_id=excluded.source_id";
+                    "DO UPDATE SET title=excluded.title, end_time=excluded.end_time, "
+                    "description=CASE WHEN excluded.description <> '' THEN excluded.description ELSE programs.description END, "
+                    "event_id=excluded.event_id, source_id=excluded.source_id";
         
         if (sqlite3_prepare_v2(db, sql, -1, &stmt_upsert, 0) != SQLITE_OK) {
             LOG_ERROR("DB", "Failed to prepare upsert stmt: %s", sqlite3_errmsg(db));
+            sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
             pthread_mutex_unlock(&db_stmt_mutex);
-            db_commit_transaction();
             return;
         }
     }
@@ -455,18 +478,25 @@ void db_bulk_upsert(ProgramList *list) {
         sqlite3_bind_int(stmt_upsert, 8, p->source_id);
 
         if (sqlite3_step(stmt_upsert) != SQLITE_DONE) {
-             LOG_ERROR("DB", "Upsert step failed: %s", sqlite3_errmsg(db));
+            LOG_ERROR("DB", "Upsert step failed: %s", sqlite3_errmsg(db));
+            transaction_ok = 0;
         }
         
         sqlite3_reset(stmt_upsert);
         sqlite3_clear_bindings(stmt_upsert);
     }
     
+    const char *finish_sql = transaction_ok ? "COMMIT;" : "ROLLBACK;";
+    if (sqlite3_exec(db, finish_sql, NULL, NULL, &transaction_error) != SQLITE_OK) {
+        LOG_ERROR("DB", "Failed to finish EPG transaction: %s",
+                  transaction_error ? transaction_error : sqlite3_errmsg(db));
+        transaction_ok = 0;
+    }
+    sqlite3_free(transaction_error);
     pthread_mutex_unlock(&db_stmt_mutex);
-    db_commit_transaction();
     
     // Invalidate cache after update
-    db_invalidate_cache();
+    if (transaction_ok) db_invalidate_cache();
 }
 
 void db_upsert_program(const char *frequency, const char *channel_service_id, long long start_time, long long end_time, const char *title, int event_id, int source_id) {
@@ -481,7 +511,9 @@ void db_upsert_program(const char *frequency, const char *channel_service_id, lo
          char *sql = "INSERT INTO programs (frequency, channel_service_id, start_time, end_time, title, description, event_id, source_id) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
                     "ON CONFLICT(frequency, channel_service_id, start_time) "
-                    "DO UPDATE SET title=excluded.title, end_time=excluded.end_time, event_id=excluded.event_id, source_id=excluded.source_id";
+                    "DO UPDATE SET title=excluded.title, end_time=excluded.end_time, "
+                    "description=CASE WHEN excluded.description <> '' THEN excluded.description ELSE programs.description END, "
+                    "event_id=excluded.event_id, source_id=excluded.source_id";
         
         if (sqlite3_prepare_v2(db, sql, -1, &stmt_upsert, 0) != SQLITE_OK) {
             LOG_ERROR("DB", "Failed to prepare upsert stmt: %s", sqlite3_errmsg(db));
@@ -537,6 +569,7 @@ void db_update_program_description(const char *frequency, const char *channel_se
 // Delete program entries that ended more than 24 hours ago
 int db_cleanup_expired() {
     if (!db) return 0;
+    pthread_mutex_lock(&db_stmt_mutex);
 
     // Calculate cutoff time: 24 hours ago in milliseconds
     struct timespec ts;
@@ -548,7 +581,8 @@ int db_cleanup_expired() {
     sqlite3_stmt *stmt;
     int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, 0);
     if (rc != SQLITE_OK) {
-        fprintf(stderr, "Cleanup prepare error: %s\n", sqlite3_errmsg(db));
+        LOG_ERROR("DB", "Cleanup prepare failed: %s", sqlite3_errmsg(db));
+        pthread_mutex_unlock(&db_stmt_mutex);
         return 0;
     }
 
@@ -556,9 +590,10 @@ int db_cleanup_expired() {
     rc = sqlite3_step(stmt);
     int deleted = sqlite3_changes(db);
     sqlite3_finalize(stmt);
+    pthread_mutex_unlock(&db_stmt_mutex);
 
     if (deleted > 0) {
-        printf("[DB] Cleaned up %d expired program entries\n", deleted);
+        LOG_INFO("DB", "Cleaned up %d expired program entries", deleted);
         db_invalidate_cache();
     }
     return deleted;

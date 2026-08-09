@@ -4,6 +4,7 @@
 #include <unistd.h>
 #include <string.h>
 #include <pthread.h>
+#include <errno.h>
 #include "config.h"
 #include "log.h"
 #include "channels.h"
@@ -18,6 +19,18 @@
 // Global configuration
 int g_verbose = 0;
 int g_no_epg = 0;
+
+static int parse_port(const char *value, int *port) {
+    if (!value || !port) return 0;
+    errno = 0;
+    char *end = NULL;
+    long parsed = strtol(value, &end, 10);
+    if (errno != 0 || !end || *end != '\0' || parsed < 1 || parsed > 65535) {
+        return 0;
+    }
+    *port = (int)parsed;
+    return 1;
+}
 
 void print_usage(const char *progname) {
     printf("ZapLink Engine - High Performance DTV Backend\n");
@@ -36,7 +49,12 @@ int main(int argc, char *argv[]) {
 
     while ((opt = getopt(argc, argv, "p:vhtsn")) != -1) {
         switch (opt) {
-            case 'p': port = atoi(optarg); break;
+            case 'p':
+                if (!parse_port(optarg, &port)) {
+                    fprintf(stderr, "Invalid port: %s\n", optarg);
+                    return 1;
+                }
+                break;
             case 'v': g_verbose = 1; break;
             case 'n': g_no_epg = 1; break;
             case 't': run_transcode_benchmark(); return 0;
@@ -53,17 +71,11 @@ int main(int argc, char *argv[]) {
     // Wait before either the scanner or the streaming engine enumerates them.
     wait_for_tuners(TUNER_WAIT_TIMEOUT_SECONDS);
     
-    // Handle manual scan request
-    if (force_scan) {
-        unlink(channels_conf_path);
-    }
+    int scan_result = scanner_check(channels_conf_path, force_scan);
+    if (scan_result > 0) return 0;
+    if (scan_result < 0) return 1;
 
-    // Interactive scanner setup if channels.conf is missing
-    if (scanner_check(channels_conf_path)) {
-        return 0; // Exit after successful setup so user can restart service
-    }
-
-    printf("ZapLink DTV Engine Starting (Port %d)...\n", port);
+    LOG_INFO("MAIN", "ZapLink DTV engine starting on port %d", port);
 
     if (!g_no_epg) {
         if (!db_init()) {
