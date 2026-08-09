@@ -178,6 +178,7 @@ void handle_unified_stream(int sockfd, StreamConfig *config, const char *http_he
             execlp("dvbv5-zap", "dvbv5-zap", 
                    "-c", channels_conf_path,
                    "-a", adapter_id,
+                   "-P", "-r",
                    "-o", "-",
                    c->number, NULL);
             _exit(1);
