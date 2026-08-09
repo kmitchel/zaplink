@@ -82,12 +82,12 @@ int is_vcn_duplicated(const char *number);
 void build_channel_lookup();
 
 /**
- * Fast lookup by frequency and service ID (O(1))
+ * Fast lookup by frequency and virtual channel number (O(1))
  * @param freq Frequency string
- * @param svc_id Service ID string (or number string)
+ * @param vcn Virtual channel number string (e.g., "15.1")
  * @return Pointer to Channel or NULL
  */
-Channel *find_channel_fast(const char *freq, const char *svc_id);
+Channel *find_channel_fast(const char *freq, const char *vcn);
 
 /**
  * Get a unique channel ID for XMLTV output (Thread-safe)

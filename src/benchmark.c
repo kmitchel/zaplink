@@ -4,8 +4,23 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <glob.h>
 #include "benchmark.h"
 #include "log.h"
+
+/* Find the first usable VA-API render node, e.g. /dev/dri/renderD128 */
+static const char *find_vaapi_device(void) {
+    static char device[64];
+    glob_t matches;
+    if (glob("/dev/dri/renderD*", GLOB_NOSORT, NULL, &matches) != 0)
+        return "/dev/dri/renderD128";  /* fallback */
+    if (matches.gl_pathc > 0)
+        snprintf(device, sizeof(device), "%s", matches.gl_pathv[0]);
+    else
+        snprintf(device, sizeof(device), "/dev/dri/renderD128");
+    globfree(&matches);
+    return device;
+}
 
 static int test_encoder(char *name, char *const extra_args[]) {
     pid_t pid = fork();
@@ -48,8 +63,9 @@ void run_transcode_benchmark() {
     static char *no_args[] = {NULL};
     static char *software_args[] = {"-preset", "ultrafast", NULL};
     static char *av1_args[] = {"-preset", "10", NULL};
-    static char *vaapi_args[] = {
-        "-vaapi_device", "/dev/dri/renderD128", "-vf",
+    const char *vaapi_dev = find_vaapi_device();
+    char *vaapi_args[] = {
+        "-vaapi_device", (char *)vaapi_dev, "-vf",
         "format=nv12,hwupload", NULL
     };
     printf("\n");

@@ -36,7 +36,6 @@ static pthread_mutex_t db_stmt_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /* XMLTV Cache */
 static char *g_xmltv_cache = NULL;
-static char *g_json_cache = NULL;
 static time_t g_last_update_time = 0;
 static pthread_mutex_t g_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
 
@@ -97,7 +96,6 @@ void db_close() {
 
     pthread_mutex_lock(&g_cache_mutex);
     if (g_xmltv_cache) { free(g_xmltv_cache); g_xmltv_cache = NULL; }
-    if (g_json_cache) { free(g_json_cache); g_json_cache = NULL; }
     pthread_mutex_unlock(&g_cache_mutex);
 
 }
@@ -146,20 +144,39 @@ int append_str(char **dest, size_t *size, size_t *cap, const char *src) {
 
 
 
-// Returns 0 on OOM, 1 on success
+// Returns 0 on OOM, 1 on success.
+// Batches runs of non-special characters to reduce per-character call overhead.
 static int xml_escape_append(char **dest, size_t *size, size_t *cap, const char *src) {
     if (!src) return 1;
-    for (const char *p = src; *p; p++) {
-        int ok;
-        switch (*p) {
-            case '&':  ok = append_str(dest, size, cap, "&amp;"); break;
-            case '<':  ok = append_str(dest, size, cap, "&lt;"); break;
-            case '>':  ok = append_str(dest, size, cap, "&gt;"); break;
-            case '"':  ok = append_str(dest, size, cap, "&quot;"); break;
-            case '\'': ok = append_str(dest, size, cap, "&apos;"); break;
-            default:   ok = append_str(dest, size, cap, (char[]){*p, 0}); break;
+    const char *run_start = src;
+    for (const char *p = src; ; p++) {
+        const char *esc = NULL;
+        if (*p == '&')       esc = "&amp;";
+        else if (*p == '<')  esc = "&lt;";
+        else if (*p == '>')  esc = "&gt;";
+        else if (*p == '"')  esc = "&quot;";
+        else if (*p == '\'') esc = "&apos;";
+        else if (*p != '\0') continue;  /* ordinary character, extend the run */
+
+        /* Flush any accumulated plain-text run */
+        if (p > run_start) {
+            size_t run_len = (size_t)(p - run_start);
+            if (*size + run_len + 1 > *cap) {
+                size_t new_cap = (*size + run_len + 1) * 2;
+                if (new_cap < *cap + 1024 * 1024) new_cap = *cap + 1024 * 1024;
+                char *tmp = realloc(*dest, new_cap);
+                if (!tmp) return 0;
+                *dest = tmp;
+                *cap = new_cap;
+            }
+            memcpy(*dest + *size, run_start, run_len);
+            *size += run_len;
+            (*dest)[*size] = '\0';
         }
-        if (!ok) return 0;
+
+        if (*p == '\0') break;
+        if (!append_str(dest, size, cap, esc)) return 0;
+        run_start = p + 1;
     }
     return 1;
 }
@@ -312,29 +329,43 @@ oom_fail:
     return NULL;
 }
 
-// Returns 0 on OOM, 1 on success
+// Returns 0 on OOM, 1 on success.
+// Batches runs of non-special characters to reduce per-character call overhead.
 static int json_escape_append(char **dest, size_t *size, size_t *cap, const char *src) {
     if (!src) return 1;
-    for (const char *p = src; *p; p++) {
-        int ok;
-        char buf[8];
-        switch (*p) {
-            case '"':  ok = append_str(dest, size, cap, "\\\""); break;
-            case '\\': ok = append_str(dest, size, cap, "\\\\"); break;
-            case '\n': ok = append_str(dest, size, cap, "\\n"); break;
-            case '\r': ok = append_str(dest, size, cap, "\\r"); break;
-            case '\t': ok = append_str(dest, size, cap, "\\t"); break;
-            default:
-                 if ((unsigned char)*p < 0x20) {
-                     snprintf(buf, sizeof(buf), "\\u%04x", (unsigned char)*p);
-                     ok = append_str(dest, size, cap, buf);
-                 } else {
-                     buf[0] = *p; buf[1] = '\0';
-                     ok = append_str(dest, size, cap, buf);
-                 }
-                 break;
+    const char *run_start = src;
+    for (const char *p = src; ; p++) {
+        const char *esc = NULL;
+        char esc_buf[8];
+        if (*p == '"')        esc = "\\\"";
+        else if (*p == '\\') esc = "\\\\";
+        else if (*p == '\n')  esc = "\\n";
+        else if (*p == '\r')  esc = "\\r";
+        else if (*p == '\t')  esc = "\\t";
+        else if ((unsigned char)*p < 0x20 && *p != '\0') {
+            snprintf(esc_buf, sizeof(esc_buf), "\\u%04x", (unsigned char)*p);
+            esc = esc_buf;
+        } else if (*p != '\0') continue;  /* ordinary character, extend the run */
+
+        /* Flush any accumulated plain-text run */
+        if (p > run_start) {
+            size_t run_len = (size_t)(p - run_start);
+            if (*size + run_len + 1 > *cap) {
+                size_t new_cap = (*size + run_len + 1) * 2;
+                if (new_cap < *cap + 1024 * 1024) new_cap = *cap + 1024 * 1024;
+                char *tmp = realloc(*dest, new_cap);
+                if (!tmp) return 0;
+                *dest = tmp;
+                *cap = new_cap;
+            }
+            memcpy(*dest + *size, run_start, run_len);
+            *size += run_len;
+            (*dest)[*size] = '\0';
         }
-        if (!ok) return 0;
+
+        if (*p == '\0') break;
+        if (!append_str(dest, size, cap, esc)) return 0;
+        run_start = p + 1;
     }
     return 1;
 }

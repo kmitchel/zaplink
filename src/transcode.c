@@ -13,6 +13,7 @@
 #include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <time.h>
+#include <glob.h>
 #include "transcode.h"
 #include "log.h"
 #include "config.h"
@@ -122,6 +123,20 @@ static void add_arg(char **argv, int *argc, const char *arg, int *err) {
     // Overflow detected
     LOG_ERROR("TRANSCODE", "Argv limit exceeded (128), dropping argument: %s", arg);
     *err = 1;
+}
+
+/* Find the first usable VA-API render node dynamically */
+static const char *find_vaapi_device(void) {
+    static char device[64];
+    glob_t matches;
+    if (glob("/dev/dri/renderD*", GLOB_NOSORT, NULL, &matches) != 0)
+        return "/dev/dri/renderD128";
+    if (matches.gl_pathc > 0)
+        snprintf(device, sizeof(device), "%s", matches.gl_pathv[0]);
+    else
+        snprintf(device, sizeof(device), "/dev/dri/renderD128");
+    globfree(&matches);
+    return device;
 }
 
 void handle_unified_stream(int sockfd, StreamConfig *config, const char *http_header) {
@@ -304,7 +319,7 @@ void handle_unified_stream(int sockfd, StreamConfig *config, const char *http_he
                     case BACKEND_VAAPI:
                         add_arg(args, &n, "-hwaccel", &err); add_arg(args, &n, "vaapi", &err);
                         add_arg(args, &n, "-hwaccel_output_format", &err); add_arg(args, &n, "vaapi", &err);
-                        add_arg(args, &n, "-hwaccel_device", &err); add_arg(args, &n, "/dev/dri/renderD128", &err);
+                        add_arg(args, &n, "-hwaccel_device", &err); add_arg(args, &n, find_vaapi_device(), &err);
                         break;
                     default: break;
                 }

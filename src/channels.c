@@ -198,12 +198,13 @@ Channel *find_channel_by_id(const char *id) {
 
 Channel *find_channel_by_freq_sid(const char *freq, int service_id) {
     if (!freq) return NULL;
-    char sid_str[32];
-    snprintf(sid_str, sizeof(sid_str), "%d", service_id);
     
     for (int i = 0; i < channel_count; i++) {
-        if (strcmp(channels[i].frequency, freq) == 0 &&
-            strcmp(channels[i].service_id, sid_str) == 0) {
+        if (strcmp(channels[i].frequency, freq) != 0) continue;
+        /* Numeric comparison handles decimal, hex (0x), and octal (0) prefixes */
+        char *endptr = NULL;
+        long stored_sid = strtol(channels[i].service_id, &endptr, 0);
+        if (endptr && *endptr == '\0' && stored_sid == (long)service_id) {
             return &channels[i];
         }
     }
@@ -228,11 +229,11 @@ int is_vcn_duplicated(const char *number) {
 #define LOOKUP_SIZE 1024
 static Channel *channel_lookup[LOOKUP_SIZE];
 
-static unsigned int hash_channel(const char *freq, const char *svc_id) {
+static unsigned int hash_channel(const char *freq, const char *vcn) {
     unsigned int hash = 5381;
     for (const char *p = freq; *p; p++) hash = ((hash << 5) + hash) + *p;
     hash = ((hash << 5) + hash) + '_';
-    for (const char *p = svc_id; *p; p++) hash = ((hash << 5) + hash) + *p;
+    for (const char *p = vcn; *p; p++) hash = ((hash << 5) + hash) + *p;
     return hash % LOOKUP_SIZE;
 }
 
@@ -249,13 +250,13 @@ void build_channel_lookup() {
     }
 }
 
-Channel *find_channel_fast(const char *freq, const char *svc_id) {
-    if (!freq || !svc_id) return NULL;
-    unsigned int h = hash_channel(freq, svc_id);
+Channel *find_channel_fast(const char *freq, const char *vcn) {
+    if (!freq || !vcn) return NULL;
+    unsigned int h = hash_channel(freq, vcn);
     unsigned int start = h;
     while (channel_lookup[h]) {
         if (strcmp(channel_lookup[h]->frequency, freq) == 0 &&
-            strcmp(channel_lookup[h]->number, svc_id) == 0) {
+            strcmp(channel_lookup[h]->number, vcn) == 0) {
             return channel_lookup[h];
         }
         h = (h + 1) % LOOKUP_SIZE;
