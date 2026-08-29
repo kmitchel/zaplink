@@ -186,7 +186,7 @@ void build_ffmpeg_arguments(const StreamConfig *config,
     add_arg(arguments, &count, "ffmpeg", argument_error);
     add_arg(arguments, &count, "-hide_banner", argument_error);
     add_arg(arguments, &count, "-loglevel", argument_error);
-    add_arg(arguments, &count, g_verbose ? "info" : "error", argument_error);
+    add_arg(arguments, &count, g_verbose ? "info" : "fatal", argument_error);
     add_arg(arguments, &count, "-fflags", argument_error);
     add_arg(arguments, &count,
             config->no_buffer ? "+genpts+discardcorrupt+nobuffer"

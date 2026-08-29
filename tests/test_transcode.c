@@ -46,6 +46,7 @@ static void test_copy_stream(void) {
     assert(has_arg(args, "ffmpeg"));
     assert(has_arg(args, "copy"));
     assert(has_arg(args, "mpegts"));
+    assert(strcmp(get_arg_val(args, "-loglevel"), "fatal") == 0);
 }
 
 static void test_software_h264(void) {
