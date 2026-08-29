@@ -21,7 +21,8 @@ OBJS = $(patsubst $(SRC_DIR)/%.c, $(OBJ_DIR)/%.o, $(SRCS))
 TARGET = $(BUILD_DIR)/zaplink
 TEST_TARGET = $(BUILD_DIR)/test_channels
 TEST_TARGETS = $(TEST_TARGET) $(BUILD_DIR)/test_tuner $(BUILD_DIR)/test_db_concurrency \
-               $(BUILD_DIR)/test_stream_config $(BUILD_DIR)/test_stream_session
+               $(BUILD_DIR)/test_stream_config $(BUILD_DIR)/test_stream_session \
+               $(BUILD_DIR)/test_transcode $(BUILD_DIR)/test_huffman
 
 all: $(TARGET)
 
@@ -55,12 +56,20 @@ $(BUILD_DIR)/test_stream_config: tests/test_stream_config.c $(OBJ_DIR)/stream_co
 $(BUILD_DIR)/test_stream_session: tests/test_stream_session.c $(OBJ_DIR)/stream_session.o $(OBJ_DIR)/stream_config.o
 	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
+$(BUILD_DIR)/test_transcode: tests/test_transcode.c $(OBJ_DIR)/transcode.o $(OBJ_DIR)/stream_config.o $(OBJ_DIR)/tuner.o $(OBJ_DIR)/channels.o $(OBJ_DIR)/stream_session.o
+	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@ $(LDFLAGS)
+
+$(BUILD_DIR)/test_huffman: tests/test_huffman.c $(OBJ_DIR)/huffman.o
+	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@ $(LDFLAGS)
+
 test: $(TARGET) $(TEST_TARGETS)
 	$(BUILD_DIR)/test_channels
 	$(BUILD_DIR)/test_tuner
 	$(BUILD_DIR)/test_db_concurrency
 	$(BUILD_DIR)/test_stream_config
 	$(BUILD_DIR)/test_stream_session
+	$(BUILD_DIR)/test_transcode
+	$(BUILD_DIR)/test_huffman
 
 http-contract-test: $(TARGET)
 	tests/test_http_contract.sh "$${ZAPLINK_TEST_BASE_URL:-http://127.0.0.1:18392}" "$${ZAPLINK_TEST_CHANNEL:-15.1}" "$${ZAPLINK_TEST_SERVER_PID:-}"

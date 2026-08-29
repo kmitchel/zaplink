@@ -29,9 +29,8 @@ int thread_pool_submit(thread_pool_t *pool, thread_func_t func, void *arg);
 
 /**
  * @brief Destroy the thread pool.
- * Waits for current jobs to finish but stops accepting new ones? 
- * Or cancels everything? 
- * Standard shutdown: set shutdown flag, broadcast cond, join threads.
+ * Signals worker threads to shut down, waits for all active threads to join,
+ * and frees any remaining queued jobs.
  * 
  * @param pool Thread pool instance.
  */

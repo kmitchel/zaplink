@@ -26,6 +26,7 @@ typedef struct {
     char service_id[32];
     char frequency[32];
     char number[32];
+    char unique_id[128];
 } Channel;
 
 /** Global array of loaded channels */

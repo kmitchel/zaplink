@@ -15,7 +15,8 @@ ZapLink has been hardened for production environments:
 - **Automatic Channel Scan**: Parallel tuner scanning with RabbitEars zip-code hints and optional VHF skipping.
 - **Reliable Device Startup**: Waits up to 30 seconds for USB DVB frontends before scanning or serving streams.
 - **Weak-Signal Filtering**: Measures each scanned multiplex and comments out channels below 20 dB C/N unless explicitly retained.
-- **Robust EPG**: Background EPG collection with valid XMLTV output supporting Jellyfin Series Recording.
+- **Robust EPG**: Low-overhead background EPG collection with valid XMLTV output supporting Jellyfin Series Recording and bounded memory footprint.
+- **Fast Channel Lookups**: Precomputed O(1) channel identifiers for rapid dispatch and collision-free subchannel routing.
 - **Live Streaming**: Supports software and hardware transcoding (QSV, VAAPI, NVENC) via FFmpeg.
 - **Fast Stream Handoffs**: Compatible MPEG-TS requests share one normalized producer and remain warm briefly across probe-to-playback reconnects.
 - **Simple API**: HTTP endpoints for M3U playlists and XMLTV guide data.
@@ -317,9 +318,11 @@ intentionally isolated.
 
 ## Verification
 
-Run the build and regression tests for channel identity, tuner lease preemption,
-concurrent EPG database writers, stream URL/profile normalization, shared
-delivery, linger cleanup, and producer-start failure recovery with:
+Run the build and regression test suite covering channel identity, precomputed
+unique IDs, tuner lease preemption, concurrent EPG database transactions, stream
+profile normalization, shared delivery, linger cleanup, producer-start failure
+recovery, FFmpeg argument generation across backends, and ATSC A/65 Huffman
+decoding with:
 
 ```sh
 make test

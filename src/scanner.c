@@ -448,11 +448,8 @@ static void parse_output_line(int tuner_id, char *line) {
     
     char *lock = strstr(line, "Lock");
     if (lock) {
-         // Filter out standard lock messages to reduce noise, or print them nicely?
-         // User asked to indicate when channels are found.
-         // Let's print lock only if signal is weak?
-         // printf("[Tuner %d] %s", tuner_id, lock);
-         return; 
+        /* Filter out standard lock progress messages to keep scan output concise */
+        return;
     }
     
     char *vchan = strstr(line, "Virtual channel");
@@ -522,8 +519,8 @@ static int run_parallel_scan(int num_adapters, char part_files[][128],
         if (pid == 0) {
             // Child
             close(pipefd[0]);
-            dup2(pipefd[1], STDERR_FILENO); // Capture stderr (where verbose logs go)
-            dup2(pipefd[1], STDOUT_FILENO); // Capture stdout too? usually configs go to -o file
+            dup2(pipefd[1], STDERR_FILENO);
+            dup2(pipefd[1], STDOUT_FILENO);
             close(pipefd[1]);
             
             char out_part[128];
@@ -579,13 +576,7 @@ static int run_parallel_scan(int num_adapters, char part_files[][128],
                     ssize_t n = read(workers[i].pipe_fd, buf, sizeof(buf) - 1);
                     if (n > 0) {
                         buf[n] = 0;
-                        // For simplicity, just scan for newlines in chunk. 
-                        // Real parser needs buffer management.
-                        // We hack it: Print line if newline found, else store?
-                        // Simplified: parse what we got. 
-                        // Ideally we buffer, but 'parse_output_line' using strstr is robust enough for fragments? No.
-                        // Let's just print complete lines.
-                        
+                        /* Buffer chunk data and process complete newline-delimited lines */
                         // Append to worker buffer
                         if (workers[i].buf_len + n < (int)sizeof(workers[i].buffer) - 1) {
                             memcpy(workers[i].buffer + workers[i].buf_len, buf, n);
@@ -645,7 +636,7 @@ static int run_parallel_scan(int num_adapters, char part_files[][128],
             }
         } 
         else if (ret == 0) {
-            // Timeout check if processes died?
+            /* Check if any worker processes exited during the timeout window */
             for (int i = 0; i < num_adapters; i++) {
                  if (workers[i].pid > 0) {
                     int status;

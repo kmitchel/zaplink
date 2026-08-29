@@ -14,4 +14,9 @@ void handle_unified_stream(int sockfd, StreamConfig *config, const char *http_he
 /** Stop and release all reusable producer sessions. */
 void shutdown_stream_sessions(void);
 
+/** Build the FFmpeg command-line argument array for a stream profile. */
+void build_ffmpeg_arguments(const StreamConfig *config,
+                           char **arguments,
+                           int *argument_error);
+
 #endif

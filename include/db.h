@@ -51,10 +51,10 @@ void db_update_program_description(const char *frequency,
                                    int event_id, const char *description);
 
 /**
- * Delete program entries that ended more than 24 hours ago
+ * Delete program entries that ended more than 48 hours ago
+ * (Retains history needed for recurring series detection)
  * @return Number of entries deleted
  */
-// Delete expired programs
 int db_cleanup_expired();
 
 typedef struct {

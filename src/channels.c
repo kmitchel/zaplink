@@ -150,6 +150,17 @@ int load_channels(const char *filename) {
         qsort(channels, channel_count, sizeof(Channel), compare_channels);
     }
 
+    /* Precompute unique IDs for O(1) retrieval */
+    for (int i = 0; i < channel_count; i++) {
+        if (is_vcn_duplicated(channels[i].number)) {
+            snprintf(channels[i].unique_id, sizeof(channels[i].unique_id), "%s-%s-%s",
+                     channels[i].number, channels[i].frequency, channels[i].service_id);
+        } else {
+            snprintf(channels[i].unique_id, sizeof(channels[i].unique_id), "%s",
+                     channels[i].number);
+        }
+    }
+
     fclose(f);
     return channel_count;
 }
@@ -182,9 +193,7 @@ Channel *find_channel_by_id(const char *id) {
     if (!id) return NULL;
 
     for (int i = 0; i < channel_count; i++) {
-        char unique_id[128];
-        get_unique_channel_id(&channels[i], unique_id, sizeof(unique_id));
-        if (strcmp(unique_id, id) == 0) return &channels[i];
+        if (strcmp(channels[i].unique_id, id) == 0) return &channels[i];
     }
 
     Channel *match = NULL;
@@ -269,7 +278,9 @@ Channel *find_channel_fast(const char *freq, const char *vcn) {
 const char *get_unique_channel_id(const Channel *ch, char *buf, size_t len) {
     if (!ch || !buf || len == 0) return "";
     
-    if (is_vcn_duplicated(ch->number)) {
+    if (ch->unique_id[0] != '\0') {
+        snprintf(buf, len, "%s", ch->unique_id);
+    } else if (is_vcn_duplicated(ch->number)) {
         snprintf(buf, len, "%s-%s-%s", ch->number, ch->frequency,
                  ch->service_id);
     } else {

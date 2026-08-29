@@ -40,6 +40,7 @@
 
 #define TS_PACKET_SIZE 188   /* MPEG-TS packet size */
 #define MAX_EIT_PIDS 8       /* Max EIT PIDs to track per mux */
+#define MAX_TRACKED_PIDS 16  /* ATSC PSIP requires base PID 0x1FFB + up to 8 EIT PIDs */
 
 /**
  * Buffer for accumulating PSI/SI section data across TS packets
@@ -54,18 +55,37 @@ typedef struct {
     int have_continuity;
 } SectionBuffer;
 
+typedef struct {
+    int pid;
+    SectionBuffer buffer;
+} TrackedPidBuffer;
+
 /**
  * Per-scan context - allows concurrent scanning on multiple tuners
  * Each worker thread gets its own context to avoid shared state
  */
 typedef struct {
-    SectionBuffer pid_buffers[8192];  /* Buffer per possible PID */
+    TrackedPidBuffer pid_buffers[MAX_TRACKED_PIDS]; /* Dynamically mapped active PIDs */
     int eit_pids[MAX_EIT_PIDS];       /* Discovered EIT PIDs from MGT */
     int eit_pid_count;                /* Number of EIT PIDs found */
     int programs_found;               /* Number of programs found (stat) */
     const char *freq;                 /* Current frequency being scanned */
     ProgramList list;                 /* Buffered programs */
 } ScanContext;
+
+static SectionBuffer *get_section_buffer(ScanContext *ctx, int pid) {
+    if (!ctx || pid <= 0) return NULL;
+    for (int i = 0; i < MAX_TRACKED_PIDS; i++) {
+        if (ctx->pid_buffers[i].pid == pid) {
+            return &ctx->pid_buffers[i].buffer;
+        }
+        if (ctx->pid_buffers[i].pid == 0) {
+            ctx->pid_buffers[i].pid = pid;
+            return &ctx->pid_buffers[i].buffer;
+        }
+    }
+    return NULL;
+}
 
 /**
  * Source ID to channel number mapping entry
@@ -122,16 +142,8 @@ static int epg_is_running(void) {
 void ctx_upsert(ScanContext *ctx, Program *p) {
     if (!ctx) return;
     
-    // Deduplicate: Check if we already have this event/source pair
-    // Linear scan is acceptable here as N < ~200 per mux
+    /* Deduplicate: within a single mux scan, (event_id, source_id) uniquely identifies an event */
     for (int i = 0; i < ctx->list.count; i++) {
-        if (ctx->list.programs[i].event_id == p->event_id &&
-            ctx->list.programs[i].source_id == p->source_id &&
-            strcmp(ctx->list.programs[i].frequency, p->frequency) == 0 &&
-            strcmp(ctx->list.programs[i].channel_service_id, p->channel_service_id) == 0) { // Check composite keys just in case
-             return;
-        }
-        // Simpler check: event_id + source_id within this MUX scan is unique roughly
         if (ctx->list.programs[i].event_id == p->event_id && 
             ctx->list.programs[i].source_id == p->source_id) {
             return;
@@ -192,9 +204,14 @@ void add_source_map(const char *freq, int source_id, const char *chan_num) {
         }
     }
     if (source_map_count < 256) {
-        strcpy(source_map[source_map_count].key, key);
-        strcpy(source_map[source_map_count].val, chan_num);
+        snprintf(source_map[source_map_count].key,
+                 sizeof(source_map[source_map_count].key), "%s", key);
+        snprintf(source_map[source_map_count].val,
+                 sizeof(source_map[source_map_count].val), "%s",
+                 chan_num ? chan_num : "");
         source_map_count++;
+    } else {
+        LOG_WARN("EPG", "Source map capacity (256) reached; dropping mapping for %s", key);
     }
     pthread_mutex_unlock(&source_map_mutex);
 }
@@ -581,7 +598,8 @@ int parse_ts_chunk(ScanContext *ctx, const unsigned char *buf, size_t len) {
         }
         if (!interesting) continue; 
 
-        SectionBuffer *section_buffer = &ctx->pid_buffers[pid];
+        SectionBuffer *section_buffer = get_section_buffer(ctx, pid);
+        if (!section_buffer) continue;
         int continuity_counter = buf[i+3] & 0x0F;
         if (section_buffer->have_continuity) {
             if (continuity_counter == section_buffer->continuity_counter) {

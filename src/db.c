@@ -463,6 +463,14 @@ oom_fail:
     return NULL;
 }
 
+static const char *SQL_PROGRAM_UPSERT =
+    "INSERT INTO programs (frequency, channel_service_id, start_time, end_time, title, description, event_id, source_id) "
+    "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+    "ON CONFLICT(frequency, channel_service_id, start_time) "
+    "DO UPDATE SET title=excluded.title, end_time=excluded.end_time, "
+    "description=CASE WHEN excluded.description <> '' THEN excluded.description ELSE programs.description END, "
+    "event_id=excluded.event_id, source_id=excluded.source_id;";
+
 // Bulk Upsert Implementation
 void db_bulk_upsert(ProgramList *list) {
     if (!db || !list || !list->programs || list->count == 0) return;
@@ -481,14 +489,7 @@ void db_bulk_upsert(ProgramList *list) {
     
     // Prepare statement if needed
     if (!stmt_upsert) {
-        char *sql = "INSERT INTO programs (frequency, channel_service_id, start_time, end_time, title, description, event_id, source_id) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
-                    "ON CONFLICT(frequency, channel_service_id, start_time) "
-                    "DO UPDATE SET title=excluded.title, end_time=excluded.end_time, "
-                    "description=CASE WHEN excluded.description <> '' THEN excluded.description ELSE programs.description END, "
-                    "event_id=excluded.event_id, source_id=excluded.source_id";
-        
-        if (sqlite3_prepare_v2(db, sql, -1, &stmt_upsert, 0) != SQLITE_OK) {
+        if (sqlite3_prepare_v2(db, SQL_PROGRAM_UPSERT, -1, &stmt_upsert, 0) != SQLITE_OK) {
             LOG_ERROR("DB", "Failed to prepare upsert stmt: %s", sqlite3_errmsg(db));
             sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
             pthread_mutex_unlock(&db_stmt_mutex);
@@ -530,44 +531,24 @@ void db_bulk_upsert(ProgramList *list) {
     if (transaction_ok) db_invalidate_cache();
 }
 
-void db_upsert_program(const char *frequency, const char *channel_service_id, long long start_time, long long end_time, const char *title, int event_id, int source_id) {
-    // Wrapper for single upsert (if needed) by creating list of 1
-    // But usually called directly for single purpose?
-    // Let's keep implementation valid but also invalidate cache
-    if (!db) return;
+void db_upsert_program(const char *frequency, const char *channel_service_id,
+                       long long start_time, long long end_time,
+                       const char *title, int event_id, int source_id) {
+    if (!db || !frequency || !channel_service_id || !title) return;
 
-    pthread_mutex_lock(&db_stmt_mutex);
-    
-    if (!stmt_upsert) {
-         char *sql = "INSERT INTO programs (frequency, channel_service_id, start_time, end_time, title, description, event_id, source_id) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
-                    "ON CONFLICT(frequency, channel_service_id, start_time) "
-                    "DO UPDATE SET title=excluded.title, end_time=excluded.end_time, "
-                    "description=CASE WHEN excluded.description <> '' THEN excluded.description ELSE programs.description END, "
-                    "event_id=excluded.event_id, source_id=excluded.source_id";
-        
-        if (sqlite3_prepare_v2(db, sql, -1, &stmt_upsert, 0) != SQLITE_OK) {
-            LOG_ERROR("DB", "Failed to prepare upsert stmt: %s", sqlite3_errmsg(db));
-            pthread_mutex_unlock(&db_stmt_mutex);
-            return;
-        }
-    }
-    
-    sqlite3_bind_text(stmt_upsert, 1, frequency, -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt_upsert, 2, channel_service_id, -1, SQLITE_STATIC);
-    sqlite3_bind_int64(stmt_upsert, 3, start_time);
-    sqlite3_bind_int64(stmt_upsert, 4, end_time);
-    sqlite3_bind_text(stmt_upsert, 5, title, -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt_upsert, 6, "", -1, SQLITE_STATIC); 
-    sqlite3_bind_int(stmt_upsert, 7, event_id);
-    sqlite3_bind_int(stmt_upsert, 8, source_id);
+    Program p;
+    memset(&p, 0, sizeof(p));
+    snprintf(p.frequency, sizeof(p.frequency), "%s", frequency);
+    snprintf(p.channel_service_id, sizeof(p.channel_service_id), "%s", channel_service_id);
+    p.start_time = start_time;
+    p.end_time = end_time;
+    snprintf(p.title, sizeof(p.title), "%s", title);
+    p.description[0] = '\0';
+    p.event_id = event_id;
+    p.source_id = source_id;
 
-    sqlite3_step(stmt_upsert);
-    sqlite3_reset(stmt_upsert);
-    sqlite3_clear_bindings(stmt_upsert);
-    
-    pthread_mutex_unlock(&db_stmt_mutex);
-    db_invalidate_cache();
+    ProgramList list = { .programs = &p, .count = 1, .capacity = 1 };
+    db_bulk_upsert(&list);
 }
 
 void db_update_program_description(const char *frequency, const char *channel_service_id, int event_id, const char *description) {
@@ -602,11 +583,11 @@ int db_cleanup_expired() {
     if (!db) return 0;
     pthread_mutex_lock(&db_stmt_mutex);
 
-    // Calculate cutoff time: 24 hours ago in milliseconds
+    // Calculate cutoff time: 48 hours ago in milliseconds (preserves history for series detection)
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     long long now_ms = (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-    long long cutoff_ms = now_ms - (48LL * 60 * 60 * 1000); // 48 hours ago to keep history for series detection
+    long long cutoff_ms = now_ms - (48LL * 60 * 60 * 1000);
 
     char *sql = "DELETE FROM programs WHERE end_time < ?";
     sqlite3_stmt *stmt;

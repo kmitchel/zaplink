@@ -109,9 +109,9 @@ static const char *find_vaapi_device(void) {
     return device;
 }
 
-static void build_ffmpeg_arguments(const StreamConfig *config,
-                                   char **arguments,
-                                   int *argument_error) {
+void build_ffmpeg_arguments(const StreamConfig *config,
+                           char **arguments,
+                           int *argument_error) {
     int count = 0;
     static _Thread_local char analyze[24];
     static _Thread_local char probe[24];
