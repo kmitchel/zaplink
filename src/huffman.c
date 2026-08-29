@@ -38,7 +38,7 @@ static int read_exact(int fd, void *buffer, size_t length) {
     return 1;
 }
 
-int huffman_init() {
+static int huffman_load(void) {
     int fd = open("huffman.bin", O_RDONLY);
     if (fd < 0) {
         // Not a fatal error, but decoding won't work
@@ -110,6 +110,19 @@ int huffman_init() {
     return 1;
 }
 
+int huffman_init(void) {
+    pthread_mutex_lock(&huffman_mutex);
+    if (!huffman_initialized) {
+        int loaded = huffman_load();
+        huffman_initialized = 1;
+        pthread_mutex_unlock(&huffman_mutex);
+        return loaded;
+    }
+    int loaded = title_trees != NULL && desc_trees != NULL;
+    pthread_mutex_unlock(&huffman_mutex);
+    return loaded;
+}
+
 void huffman_cleanup() {
     pthread_mutex_lock(&huffman_mutex);
     if (title_trees) free(title_trees);
@@ -128,10 +141,9 @@ static int get_bit(const uint8_t *src, int bit_pos) {
 int huffman_decode(int compr_type, const uint8_t *src, int src_len, char *dest, int dest_len) {
     if ((compr_type != 1 && compr_type != 2) || !src || src_len <= 0 ||
         !dest || dest_len <= 0 || src_len > INT_MAX / 8) return 0;
-    // Lazy initialization: load tables on first decode attempt
     pthread_mutex_lock(&huffman_mutex);
     if (!huffman_initialized) {
-        huffman_init();
+        huffman_load();
         huffman_initialized = 1;
     }
     pthread_mutex_unlock(&huffman_mutex);

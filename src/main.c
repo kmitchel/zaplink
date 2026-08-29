@@ -19,6 +19,7 @@
 // Global configuration
 int g_verbose = 0;
 int g_no_epg = 0;
+static int epg_scan_enabled = 0;
 
 static int parse_port(const char *value, int *port) {
     if (!value || !port) return 0;
@@ -32,12 +33,24 @@ static int parse_port(const char *value, int *port) {
     return 1;
 }
 
+static int configure_channel_path(void) {
+    const char *configured = getenv("ZAPLINK_CHANNELS_PATH");
+    if (!configured || !*configured) return 1;
+    if (snprintf(channels_conf_path, sizeof(channels_conf_path), "%s",
+                 configured) >= (int)sizeof(channels_conf_path)) {
+        LOG_ERROR("MAIN", "ZAPLINK_CHANNELS_PATH is too long");
+        return 0;
+    }
+    return 1;
+}
+
 void print_usage(const char *progname) {
     printf("ZapLink Engine - High Performance DTV Backend\n");
-    printf("Usage: %s [-p port] [-v] [-t] [-s] [-n]\n", progname);
+    printf("Usage: %s [-p port] [-v] [-t] [-s] [-e] [-n]\n", progname);
     printf("  -p port           HTTP Port (default: %d)\n", DEFAULT_PORT);
     printf("  -v                Verbose logging\n");
-    printf("  -n                Disable EPG background engine\n");
+    printf("  -n                Disable EPG database and XMLTV endpoint\n");
+    printf("  -e                Enable periodic EPG tuner scans\n");
     printf("  -t                Run hardware transcoding benchmark\n");
     printf("  -s                Run channel scanner setup\n");
 }
@@ -47,7 +60,7 @@ int main(int argc, char *argv[]) {
     int opt;
     int force_scan = 0;
 
-    while ((opt = getopt(argc, argv, "p:vhtsn")) != -1) {
+    while ((opt = getopt(argc, argv, "p:vhtsne")) != -1) {
         switch (opt) {
             case 'p':
                 if (!parse_port(optarg, &port)) {
@@ -57,6 +70,7 @@ int main(int argc, char *argv[]) {
                 break;
             case 'v': g_verbose = 1; break;
             case 'n': g_no_epg = 1; break;
+            case 'e': epg_scan_enabled = 1; break;
             case 't': run_transcode_benchmark(); return 0;
             case 's': force_scan = 1; break;
             case 'h': print_usage(argv[0]); return 0;
@@ -66,6 +80,8 @@ int main(int argc, char *argv[]) {
 
     // Ignore SIGPIPE (handled by checking write return values)
     signal(SIGPIPE, SIG_IGN);
+
+    if (!configure_channel_path()) return 1;
 
     // USB DVB devices can appear a few seconds after the service starts.
     // Wait before either the scanner or the streaming engine enumerates them.
@@ -99,22 +115,22 @@ int main(int argc, char *argv[]) {
         LOG_WARN("MAIN", "No tuners found - streaming will not be available");
     }
     
-    // Start EPG Background Engine
-    if (!g_no_epg) {
+    if (!g_no_epg && epg_scan_enabled) {
         LOG_INFO("MAIN", "Starting EPG Engine...");
         start_epg_thread();
+    } else if (!g_no_epg) {
+        LOG_INFO("MAIN", "Periodic EPG tuner scans are disabled; use -e to enable them");
     }
 
-    // Start HTTP Server (blocks until shutdown signal)
-    LOG_INFO("MAIN", "Starting HTTP Interface for Jellyfin...");
-    start_http_server(port);
+    LOG_INFO("MAIN", "Starting HTTP interface...");
+    int http_result = start_http_server(port);
 
     // Cleanup on exit (HTTP server returned due to signal)
     LOG_INFO("MAIN", "Shutting down...");
-    if (!g_no_epg) {
+    if (!g_no_epg && epg_scan_enabled) {
         stop_epg_thread();
     }
     db_close();
     LOG_INFO("MAIN", "Shutdown complete");
-    return 0;
+    return http_result == 0 ? 0 : 1;
 }

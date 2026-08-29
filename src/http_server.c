@@ -194,123 +194,6 @@ void send_response(int sockfd, const char *status, const char *type, const char 
     send_response_ex(sockfd, status, type, body, 0);
 }
 
-// ... URL utilities ...
-static void url_decode(char *s) {
-    char *dst = s;
-    while (*s) {
-        if (*s == '%' && s[1] && s[2]) {
-            unsigned int val;
-            if (sscanf(s + 1, "%2x", &val) == 1) {
-                *dst++ = (char)val;
-                s += 3;
-                continue;
-            }
-        } else if (*s == '+') {
-            *dst++ = ' ';
-            s++;
-            continue;
-        }
-        *dst++ = *s++;
-    }
-    *dst = '\0';
-}
-
-int get_query_param(const char *query, const char *key, char *dest, size_t dest_len) {
-    if (!query || !key || !dest || dest_len == 0) return 0;
-    size_t key_len = strlen(key);
-    const char *parameter = query;
-    while (*parameter) {
-        const char *end = strchr(parameter, '&');
-        if (!end) end = parameter + strlen(parameter);
-        const char *equals = memchr(parameter, '=', (size_t)(end - parameter));
-        if (equals && (size_t)(equals - parameter) == key_len &&
-            strncmp(parameter, key, key_len) == 0) {
-            const char *value = equals + 1;
-            size_t len = (size_t)(end - value);
-            if (len >= dest_len) return -1;
-            memcpy(dest, value, len);
-            dest[len] = '\0';
-            url_decode(dest);
-            return 1;
-        }
-        parameter = *end ? end + 1 : end;
-    }
-    return 0;
-}
-
-static int parse_bounded_int(const char *text, int minimum, int maximum,
-                             int *value) {
-    if (!text || !*text || !value) return 0;
-    errno = 0;
-    char *end = NULL;
-    long parsed = strtol(text, &end, 10);
-    if (errno != 0 || !end || *end != '\0' || parsed < minimum ||
-        parsed > maximum) return 0;
-    *value = (int)parsed;
-    return 1;
-}
-
-static int parse_stream_config(const char *channel_path, const char *query,
-                               StreamConfig *config, char *error,
-                               size_t error_size) {
-    stream_config_init(config);
-    TranscodeContainer path_container = OUTPUT_INVALID;
-    if (channel_path &&
-        !stream_config_parse_channel_path(channel_path, config->channel_num,
-                                          sizeof(config->channel_num),
-                                          &path_container)) {
-        snprintf(error, error_size, "Invalid channel identifier");
-        return 0;
-    }
-
-    char backend[64] = {0}, codec[64] = {0}, bitrate[64] = {0};
-    char audio[64] = {0}, latency[64] = {0}, container[64] = {0};
-    int has_backend = get_query_param(query, "backend", backend, sizeof(backend));
-    int has_codec = get_query_param(query, "codec", codec, sizeof(codec));
-    int has_bitrate = get_query_param(query, "bitrate", bitrate, sizeof(bitrate));
-    int has_audio = get_query_param(query, "audio", audio, sizeof(audio));
-    int has_latency = get_query_param(query, "latency", latency, sizeof(latency));
-    int has_container = get_query_param(query, "container", container, sizeof(container));
-    if (has_backend < 0 || has_codec < 0 || has_bitrate < 0 || has_audio < 0 ||
-        has_latency < 0 || has_container < 0) {
-        snprintf(error, error_size, "Query parameter is too long");
-        return 0;
-    }
-
-    config->backend = has_backend ? parse_backend(backend) : BACKEND_SOFTWARE;
-    config->codec = has_codec ? parse_codec(codec) : CODEC_COPY;
-    config->latency = has_latency ? parse_latency(latency) : LATENCY_BALANCED;
-    TranscodeContainer query_container = has_container
-        ? parse_container(container) : OUTPUT_INVALID;
-    if (config->backend == BACKEND_INVALID || config->codec == CODEC_INVALID ||
-        config->latency == LATENCY_INVALID ||
-        (has_container && query_container == OUTPUT_INVALID)) {
-        snprintf(error, error_size, "Invalid backend, codec, container, or latency profile");
-        return 0;
-    }
-
-    if (has_bitrate && !parse_bounded_int(bitrate, 1, MAX_BITRATE_KBPS,
-                                           &config->bitrate_kbps)) {
-        snprintf(error, error_size, "Invalid bitrate");
-        return 0;
-    }
-    if (has_audio) {
-        if (strcmp(audio, "6") == 0 || strcmp(audio, "5.1") == 0 ||
-            strcmp(audio, "51") == 0) {
-            config->audio_channels = 6;
-        } else if (!parse_bounded_int(audio, 1, 8, &config->audio_channels)) {
-            snprintf(error, error_size, "Invalid audio channel count");
-            return 0;
-        }
-    }
-
-    if (!stream_config_finalize(config, path_container, query_container)) {
-        snprintf(error, error_size, "Container conflicts with the URL or codec");
-        return 0;
-    }
-    return 1;
-}
-
 // M3U Cache
 static char *g_m3u_cache = NULL;
 static char g_m3u_cache_host[256] = {0};
@@ -333,8 +216,8 @@ void handle_m3u(int sockfd, const char *host, const char *query, int head_only) 
 
     StreamConfig playlist_config;
     char parse_error[160];
-    if (!parse_stream_config(NULL, query, &playlist_config, parse_error,
-                             sizeof(parse_error))) {
+    if (!stream_config_parse_request(NULL, query, &playlist_config, parse_error,
+                                     sizeof(parse_error))) {
         send_response_ex(sockfd, "400 Bad Request", "text/plain", parse_error,
                          head_only);
         return;
@@ -343,7 +226,8 @@ void handle_m3u(int sockfd, const char *host, const char *query, int head_only) 
     size_t cap = 64 * 1024, size = 0;
     char *m3u = malloc(cap);
     if (!m3u) {
-        send_response(sockfd, "500 Internal Server Error", "text/plain", "Memory allocation failed");
+        send_response_ex(sockfd, "500 Internal Server Error", "text/plain",
+                         "Memory allocation failed", head_only);
         return;
     }
     strcpy(m3u, "#EXTM3U\n");
@@ -371,7 +255,8 @@ void handle_m3u(int sockfd, const char *host, const char *query, int head_only) 
             char *new_m3u = realloc(m3u, cap);
             if (!new_m3u) {
                 free(m3u);
-                send_response(sockfd, "500 Internal Server Error", "text/plain", "Memory allocation failed");
+                send_response_ex(sockfd, "500 Internal Server Error", "text/plain",
+                                 "Memory allocation failed", head_only);
                 return;
             }
             m3u = new_m3u;
@@ -409,11 +294,7 @@ void process_client_request(void *arg) {
     setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
-    // Logic from old client_thread...
-    
-    // Parse Request
-    char method[16], full_path[1024], protocol[16]; // Increased buffers just in case
-    // Note: buffer is guaranteed null-terminated by the reader loop
+    char method[16], full_path[1024], protocol[16];
     if (sscanf(buffer, "%15s %1023s %15s", method, full_path, protocol) != 3) {
         send_response(sockfd, "400 Bad Request", "text/plain", "Malformed request");
         finish_client(ctx);
@@ -473,8 +354,8 @@ void process_client_request(void *arg) {
     } else if (strncmp(path, "/stream/", 8) == 0) {
         StreamConfig config;
         char parse_error[160];
-        if (!parse_stream_config(path + 8, query, &config, parse_error,
-                                 sizeof(parse_error))) {
+        if (!stream_config_parse_request(path + 8, query, &config, parse_error,
+                                         sizeof(parse_error))) {
             send_response_ex(sockfd, "400 Bad Request", "text/plain", parse_error,
                              head_only);
             finish_client(ctx);
@@ -505,16 +386,20 @@ void process_client_request(void *arg) {
         if (head_only) write_all(sockfd, head, strlen(head));
         else handle_unified_stream(sockfd, &config, head);
     } else {
-        send_response(sockfd, "404 Not Found", "text/plain", "ZapLink Engine: Valid endpoints: /stream/{ch}, /playlist.m3u, /xmltv.xml");
+        send_response_ex(sockfd, "404 Not Found", "text/plain",
+                         "ZapLink Engine: Valid endpoints: /stream/{ch}, /playlist.m3u, /xmltv.xml",
+                         head_only);
     }
 
     finish_client(ctx);
 }
 
-void start_http_server(int port) {
+int start_http_server(int port) {
+    int result = 1;
+    http_running = 1;
     if (pipe(shutdown_pipe) < 0) {
-        LOG_ERROR("HTTP", "Failed to create shutdown pipe");
-        return;
+        LOG_ERROR("HTTP", "Failed to create shutdown pipe: %s", strerror(errno));
+        goto startup_failure;
     }
     set_nonblocking(shutdown_pipe[0]);
     set_nonblocking(shutdown_pipe[1]);
@@ -529,13 +414,13 @@ void start_http_server(int port) {
     pool = thread_pool_create(THREAD_POOL_SIZE);
     if (!pool) {
         LOG_ERROR("HTTP", "Failed to create thread pool");
-        return;
+        goto startup_failure;
     }
 
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) {
         LOG_ERROR("HTTP", "Failed to create socket: %s", strerror(errno));
-        return;
+        goto startup_failure;
     }
     
     int opt = 1;
@@ -545,36 +430,34 @@ void start_http_server(int port) {
     struct sockaddr_in address = { .sin_family = AF_INET, .sin_addr.s_addr = INADDR_ANY, .sin_port = htons(port) };
     if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
         LOG_ERROR("HTTP", "Failed to bind to port %d: %s", port, strerror(errno));
-        close(server_fd);
-        return;
+        goto startup_failure;
     }
     
     if (listen(server_fd, 10) < 0) {
         LOG_ERROR("HTTP", "Failed to listen: %s", strerror(errno));
-        close(server_fd);
-        return;
+        goto startup_failure;
     }
 
     epoll_fd = epoll_create1(0);
     if (epoll_fd < 0) {
         LOG_ERROR("HTTP", "Failed to create epoll: %s", strerror(errno));
-        close(server_fd);
-        return;
+        goto startup_failure;
     }
 
     struct epoll_event ev, events[MAX_EVENTS];
     ev.events = EPOLLIN;
     ev.data.ptr = &listener_token;
     if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &ev) < 0) {
-        LOG_ERROR("HTTP", "epoll_ctl: listener");
-        close(server_fd);
-        close(epoll_fd);
-        return;
+        LOG_ERROR("HTTP", "Unable to register listener with epoll: %s",
+                  strerror(errno));
+        goto startup_failure;
     }
 
     ev.data.ptr = &shutdown_token;
     if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, shutdown_pipe[0], &ev) < 0) {
-        LOG_ERROR("HTTP", "epoll_ctl: pipe");
+        LOG_ERROR("HTTP", "Unable to register shutdown pipe with epoll: %s",
+                  strerror(errno));
+        goto startup_failure;
     }
 
     LOG_INFO("HTTP", "Listening optimized (epoll+pool) on port %d", port);
@@ -583,7 +466,7 @@ void start_http_server(int port) {
         int nfds = epoll_wait(epoll_fd, events, MAX_EVENTS, 1000);
         if (nfds < 0) {
             if (errno == EINTR) continue;
-            LOG_ERROR("HTTP", "epoll_wait failed");
+            LOG_ERROR("HTTP", "epoll_wait failed: %s", strerror(errno));
             break;
         }
         if (nfds == 0) {
@@ -598,7 +481,6 @@ void start_http_server(int port) {
             }
 
             if (events[i].data.ptr == &listener_token) {
-                // Accept connection
                 struct sockaddr_in client_addr;
                 socklen_t client_len = sizeof(client_addr);
                 int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
@@ -624,7 +506,7 @@ void start_http_server(int port) {
 
                 struct epoll_event client_ev;
                 client_ev.events = EPOLLIN | EPOLLET;
-                client_ev.data.ptr = ctx; // Use ptr to store context
+                client_ev.data.ptr = ctx;
                 if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &client_ev) < 0) {
                     close(client_fd);
                     free(ctx);
@@ -632,20 +514,17 @@ void start_http_server(int port) {
                     add_pending_client(ctx);
                 }
             } else {
-                // Read from client in loop for EPOLLET
                 client_context_t *ctx = (client_context_t *)events[i].data.ptr;
                 
                 while (1) {
                     ssize_t n = read(ctx->fd, ctx->buffer + ctx->total_read, sizeof(ctx->buffer) - 1 - ctx->total_read);
                     if (n < 0) {
                         if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                            break; // Drained
+                            break;
                         }
-                        // Error
                         close_pending_client(ctx);
                         break;
                     } else if (n == 0) {
-                        // EOF
                         close_pending_client(ctx);
                         break;
                     }
@@ -654,15 +533,12 @@ void start_http_server(int port) {
                     ctx->buffer[ctx->total_read] = '\0';
 
                 if (strstr(ctx->buffer, "\r\n\r\n")) {
-                    // Full header receive
                     epoll_ctl(epoll_fd, EPOLL_CTL_DEL, ctx->fd, NULL);
                     remove_pending_client(ctx);
                     
-                    // Pre-parse to determine dispatch target
                     char method[16], path[1024];
                     if (sscanf(ctx->buffer, "%15s %1023s", method, path) == 2) {
                         if (strncmp(path, "/stream/", 8) == 0) {
-                            // Direct streaming request -> Detached thread
                             if (!reserve_stream(ctx->fd)) {
                                 LOG_WARN("HTTP", "Max concurrent streams reached, dropping request");
                                 send_response(ctx->fd, "503 Service Unavailable", "text/plain", "Too many streams");
@@ -681,7 +557,6 @@ void start_http_server(int port) {
                                 }
                             }
                         } else {
-                            // API Request -> Thread Pool
                             if (thread_pool_submit(pool, process_client_request, ctx) < 0) {
                                 LOG_WARN("HTTP", "Thread pool full, dropping request");
                                 send_response(ctx->fd, "503 Service Unavailable", "text/plain", "Server busy");
@@ -690,13 +565,12 @@ void start_http_server(int port) {
                             }
                         }
                     } else {
-                         // Malformed, let the worker handle/reject it (or reject here, but worker is safer for full parsing)
                          if (thread_pool_submit(pool, process_client_request, ctx) < 0) {
                              close(ctx->fd);
                              free(ctx);
                          }
                     }
-                    break; // Request dispatched
+                    break;
                 } 
                     
                     if (ctx->total_read >= sizeof(ctx->buffer) - 1) {
@@ -711,13 +585,19 @@ void start_http_server(int port) {
     }
 
 cleanup:
+    result = http_running ? 1 : 0;
     while (pending_clients) close_pending_client(pending_clients);
     stop_active_streams();
     shutdown_stream_sessions();
-    thread_pool_destroy(pool);
-    close(epoll_fd);
-    close(server_fd);
-    close(shutdown_pipe[0]);
-    close(shutdown_pipe[1]);
+startup_failure:
+    if (pool) thread_pool_destroy(pool);
+    if (epoll_fd >= 0) close(epoll_fd);
+    if (server_fd >= 0) close(server_fd);
+    if (shutdown_pipe[0] >= 0) close(shutdown_pipe[0]);
+    if (shutdown_pipe[1] >= 0) close(shutdown_pipe[1]);
+    pool = NULL;
+    epoll_fd = server_fd = -1;
+    shutdown_pipe[0] = shutdown_pipe[1] = -1;
     LOG_INFO("HTTP", "Server stopped");
+    return result;
 }

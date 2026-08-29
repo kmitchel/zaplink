@@ -8,6 +8,8 @@ User=zaplink
 Group=zaplink
 SupplementaryGroups=video render
 WorkingDirectory=/opt/zaplink
+Environment=ZAPLINK_DB_PATH=/var/lib/zaplink/epg.db
+Environment=ZAPLINK_CHANNELS_PATH=/var/lib/zaplink/channels.conf
 ExecStart=/opt/zaplink/zaplink
 Restart=on-failure
 RestartSec=5
@@ -18,7 +20,7 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectHome=yes
 ProtectSystem=strict
-ReadWritePaths=/opt/zaplink
+ReadWritePaths=/var/lib/zaplink
 RestrictSUIDSGID=yes
 LockPersonality=yes
 UMask=0027

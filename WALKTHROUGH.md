@@ -12,9 +12,9 @@ This document details the security and robustness improvements applied to the Za
 ## 2. Implementation Details
 
 ### Process Execution Refactor (`src/transcode.c`)
-The pipeline `dvbv5-zap | ffmpeg` is now constructed using direct system calls:
--   **`fork()` & `pipe()`**: Processes are spawned individually with manual pipe management.
--   **`execvp()` / `execlp()`**: Binaries are executed directly, bypassing the shell.
+The pipeline `dvbv5-zap | ffmpeg` is constructed without a shell:
+-   **`posix_spawnp()` & `pipe2()`**: Both children are launched with explicit file actions and a shared process group. Argument and device discovery occurs in the parent, so no allocation-dependent work occurs in a post-`fork()` child.
+-   **Launch diagnostics**: `posix_spawnp()` reports executable and setup failures directly. A producer becomes ready only after media bytes arrive; premature pipeline exit is reported to subscribers.
 -   **Transport Output**: `dvbv5-zap` runs with `-p -o -`. Lowercase `-p` selects the requested service PIDs, adds PAT/PMT, implies record mode, and writes MPEG-TS to the pipeline. Uppercase `-P` must not be used here because it emits every program on the multiplex and allows FFmpeg to select the first subchannel.
 -   **Low-Latency Output**: MPEG-TS output repeats PAT/PMT, marks the initial discontinuity, flushes packets promptly, and uses time-based forced keyframes for transcoded video.
 
@@ -36,14 +36,14 @@ The pipeline `dvbv5-zap | ffmpeg` is now constructed using direct system calls:
 ### Argument Safety Strategy
 To prevent command truncation or buffer overflows, a "sticky error" pattern is used for building the argument list:
 -   **`add_arg` Helper**: Accepts an error pointer (`int *err`).
--   **Propagation**: If an overflow occurs (limit 128), `add_arg` sets the error flag and logs an error. Subsequent calls no-op.
--   **Pre-Execution Check**: Before calling `execvp`, the error flag is checked. If set, the process aborts immediately with `_exit(1)`. This guarantees that partial or corrupted commands are **never** executed.
+-   **Propagation**: If an overflow occurs (limit 128), `add_arg` sets the error flag and subsequent calls no-op.
+-   **Pre-Execution Check**: The error flag is checked in the parent before either process is launched, so partial commands are never executed.
 
 ### HTTP Server Hardening (`src/http_server.c`)
 -   **Buffered Reading**: Handles fragmented TCP packets robustly.
 -   **Size Limit**: Enforces a 4KB maximum for HTTP headers.
 -   **Header Deadline**: Incomplete requests expire after 10 seconds and pending header connections are capped.
--   **Input Validation**: Methods, exact query names, codecs, containers, latency profiles, backends, bitrates, and audio channel counts are validated before dispatch.
+-   **Input Validation**: A single parser rejects unknown or duplicate names, empty values, malformed percent escapes, decoded control characters, invalid ranges, and container conflicts before dispatch.
 -   **Side-Effect-Free HEAD**: Stream metadata can be inspected without creating a pipeline or reserving DVB hardware.
 -   **Deferred Response**: Waits for valid stream data before sending `200 OK`.
 -   **Bounded Pipelines**: Stream startup and later no-data stalls terminate after 15 seconds with bounded process-group cleanup.
@@ -68,7 +68,7 @@ To prevent command truncation or buffer overflows, a "sticky error" pattern is u
 ### Tuner Ownership and EPG Shutdown (`src/tuner.c`, `src/epg.c`)
 
 -   Every tuner acquisition receives a generation. A preempted EPG worker cannot release or overwrite the stream lease that replaced it.
--   EPG child PIDs are accessed under the tuner mutex.
+-   Ownership transitions occur under the tuner mutex, but all signals and waits occur after it is released. Termination has bounded TERM and KILL phases; a detached reaper keeps an unresponsive process quarantined until it exits.
 -   The orchestrator is joinable, successfully created workers are tracked, and shutdown interrupts EPG children before joining all threads and closing SQLite.
 -   Complete SQLite reads and write transactions are serialized on the shared connection.
 -   PSIP sections are rejected when their declared length or MPEG-2 CRC is invalid, and transport continuity gaps reset partial section assembly.
@@ -90,6 +90,6 @@ To prevent command truncation or buffer overflows, a "sticky error" pattern is u
 -   **Process Tree**: Confirmed no `sh` processes in the hierarchy.
 -   **Startup Readiness**: Verified immediate discovery with two frontends and the bounded 30-second no-device timeout path.
 -   **Signal Filtering**: Verified both default exclusion and explicit retention against a 49-channel configuration; the filtered file loaded only active, uncommented services.
--   **Regression Tests**: `make test` verifies duplicate IDs, stale tuner lease rejection, simultaneous EPG database writers, typed and compatibility URLs, profile normalization, multi-subscriber reuse, linger cleanup, and producer failure recovery.
+-   **Regression Tests**: `make test` includes hermetic HTTP tests and verifies duplicate IDs, stale and concurrent tuner lease handling, strict query parsing, typed and compatibility URLs, profile normalization, concurrent reuse, isolation, capacity, overrun, linger cleanup, process launch errors, listener failure, and producer recovery.
 -   **Noninteractive Scanner**: Closed stdin exits with status 1 and a structured error without modifying `channels.conf`.
 -   **Graceful Streaming Shutdown**: An active transport stream terminates and releases its tuner within one second of SIGTERM in the hardware integration check.

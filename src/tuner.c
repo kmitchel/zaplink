@@ -144,38 +144,85 @@ void discover_tuners() {
     }
     closedir(d);
     
-    // Sort logic could be added here
     LOG_INFO("TUNER", "Discovered %d tuners", tuner_count);
 }
 
-// Internal helper to terminate a process gracefully
-static void terminate_process(pid_t pid) {
-    if (pid <= 0) return;
-    
-    // First try SIGTERM for graceful shutdown
-    if (kill(pid, SIGTERM) == -1) {
-        if (errno == ESRCH) return; // Process doesn't exist
-    }
-    
-    // Wait briefly for process to exit
+static int wait_for_process(pid_t pid, int attempts) {
     int status;
-    for (int i = 0; i < 10; i++) {
+    for (int i = 0; i < attempts; i++) {
         pid_t result = waitpid(pid, &status, WNOHANG);
-        if (result == pid || result == -1) {
-            return; // Process exited or error
-        }
-        usleep(50000); // 50ms
+        if (result == pid || (result < 0 && errno == ECHILD)) return 1;
+        if (result < 0 && errno != EINTR) return 0;
+        usleep(50000);
     }
-    
-    // Process didn't exit gracefully, force kill
-    kill(pid, SIGKILL);
-    waitpid(pid, &status, 0); // Reap the zombie
+    return 0;
+}
+
+/* This function is intentionally bounded and is never called with
+ * tuner_mutex held. */
+static int terminate_process(pid_t pid) {
+    if (pid <= 0) return 1;
+    if (kill(pid, SIGTERM) < 0 && errno == ESRCH) return 1;
+    if (wait_for_process(pid, 10)) return 1;
+    if (kill(pid, SIGKILL) < 0 && errno == ESRCH) return 1;
+    return wait_for_process(pid, 10);
 }
 
 static unsigned long next_generation(Tuner *t) {
     t->generation++;
     if (t->generation == 0) t->generation++;
     return t->generation;
+}
+
+typedef struct {
+    Tuner *tuner;
+    unsigned long generation;
+    pid_t pid;
+} TerminationReaper;
+
+static void *reap_terminated_process(void *opaque) {
+    TerminationReaper *reaper = opaque;
+    int status;
+    pid_t result;
+    do {
+        result = waitpid(reaper->pid, &status, 0);
+    } while (result < 0 && errno == EINTR);
+
+    if (result == reaper->pid || (result < 0 && errno == ECHILD)) {
+        pthread_mutex_lock(&tuner_mutex);
+        if (reaper->tuner->generation == reaper->generation &&
+            reaper->tuner->user_type == USER_STOPPING) {
+            reaper->tuner->zap_pid = 0;
+            reaper->tuner->in_use = 0;
+            reaper->tuner->user_type = USER_NONE;
+            next_generation(reaper->tuner);
+            LOG_INFO("TUNER", "Quarantined tuner %d is available again",
+                     reaper->tuner->id);
+        }
+        pthread_mutex_unlock(&tuner_mutex);
+    }
+    free(reaper);
+    return NULL;
+}
+
+static void schedule_reaper(Tuner *tuner, unsigned long generation, pid_t pid) {
+    TerminationReaper *reaper = malloc(sizeof(*reaper));
+    if (!reaper) {
+        LOG_ERROR("TUNER", "Unable to monitor stuck process %d", pid);
+        return;
+    }
+    *reaper = (TerminationReaper) {
+        .tuner = tuner, .generation = generation, .pid = pid
+    };
+    pthread_t thread;
+    int result = pthread_create(&thread, NULL, reap_terminated_process, reaper);
+    if (result != 0) {
+        LOG_ERROR("TUNER", "Unable to create process reaper for %d: %s",
+                  pid, strerror(result));
+        free(reaper);
+        return;
+    }
+    pthread_detach(thread);
 }
 
 Tuner *acquire_tuner(TunerUser purpose, unsigned long *lease_generation) {
@@ -187,7 +234,6 @@ Tuner *acquire_tuner(TunerUser purpose, unsigned long *lease_generation) {
         return NULL;
     }
 
-    // 1. Look for idle tuner
     for (int i = 0; i < tuner_count; i++) {
         int idx = (last_tuner_index + 1 + i) % tuner_count;
         if (!tuners[idx].in_use) {
@@ -200,27 +246,41 @@ Tuner *acquire_tuner(TunerUser purpose, unsigned long *lease_generation) {
         }
     }
 
-    // 2. If it's a STREAM request, look for an EPG tuner to preempt
     if (purpose == USER_STREAM) {
         for (int i = 0; i < tuner_count; i++) {
             int idx = (last_tuner_index + 1 + i) % tuner_count;
             if (tuners[idx].user_type == USER_EPG) {
-                LOG_DEBUG("TUNER", "Preempting EPG scan on Tuner %d for STREAM", tuners[idx].id);
-                
-                // Kill the EPG scan process
-                // Note: terminate_process reaps the zombie
-                if (tuners[idx].zap_pid > 0) {
-                    terminate_process(tuners[idx].zap_pid);
-                    tuners[idx].zap_pid = 0;
-                }
-                
-                // Keep in_use=1 but change type
-                tuners[idx].user_type = USER_STREAM;
-                *lease_generation = next_generation(&tuners[idx]);
-                last_tuner_index = idx;
-                
+                Tuner *tuner = &tuners[idx];
+                pid_t pid = tuner->zap_pid;
+                tuner->zap_pid = 0;
+                tuner->user_type = USER_STOPPING;
+                unsigned long transition = next_generation(tuner);
                 pthread_mutex_unlock(&tuner_mutex);
-                return &tuners[idx];
+
+                if (pid > 0) {
+                    LOG_INFO("TUNER", "Preempting EPG process %d on tuner %d",
+                             pid, tuner->id);
+                }
+                int stopped = terminate_process(pid);
+                if (!stopped) schedule_reaper(tuner, transition, pid);
+
+                pthread_mutex_lock(&tuner_mutex);
+                if (!stopped || tuner->generation != transition ||
+                    tuner->user_type != USER_STOPPING) {
+                    if (!stopped && tuner->generation == transition) {
+                        tuner->zap_pid = pid;
+                        LOG_ERROR("TUNER",
+                                  "Process %d did not stop; tuner %d quarantined",
+                                  pid, tuner->id);
+                    }
+                    pthread_mutex_unlock(&tuner_mutex);
+                    return NULL;
+                }
+                tuner->user_type = USER_STREAM;
+                *lease_generation = next_generation(tuner);
+                last_tuner_index = idx;
+                pthread_mutex_unlock(&tuner_mutex);
+                return tuner;
             }
         }
     }
@@ -259,15 +319,35 @@ int tuner_lease_is_current(Tuner *t, unsigned long lease_generation) {
 }
 
 void cancel_tuner_users(TunerUser purpose) {
-    pthread_mutex_lock(&tuner_mutex);
     for (int i = 0; i < tuner_count; i++) {
+        pthread_mutex_lock(&tuner_mutex);
         if (tuners[i].in_use && tuners[i].user_type == purpose &&
             tuners[i].zap_pid > 0) {
-            terminate_process(tuners[i].zap_pid);
+            pid_t pid = tuners[i].zap_pid;
             tuners[i].zap_pid = 0;
+            tuners[i].user_type = USER_STOPPING;
+            unsigned long transition = next_generation(&tuners[i]);
+            pthread_mutex_unlock(&tuner_mutex);
+
+            int stopped = terminate_process(pid);
+            if (!stopped) schedule_reaper(&tuners[i], transition, pid);
+            pthread_mutex_lock(&tuner_mutex);
+            if (tuners[i].generation == transition &&
+                tuners[i].user_type == USER_STOPPING) {
+                if (stopped) {
+                    tuners[i].in_use = 0;
+                    tuners[i].user_type = USER_NONE;
+                    next_generation(&tuners[i]);
+                } else {
+                    tuners[i].zap_pid = pid;
+                    LOG_ERROR("TUNER",
+                              "Process %d did not stop; tuner %d quarantined",
+                              pid, tuners[i].id);
+                }
+            }
         }
+        pthread_mutex_unlock(&tuner_mutex);
     }
-    pthread_mutex_unlock(&tuner_mutex);
 }
 
 void release_tuner(Tuner *t, unsigned long lease_generation) {
@@ -281,15 +361,26 @@ void release_tuner(Tuner *t, unsigned long lease_generation) {
         return;
     }
 
-    // Terminate child processes and wait to prevent zombies.
-    if (t->zap_pid > 0) {
-        terminate_process(t->zap_pid);
-        t->zap_pid = 0;
+    pid_t pid = t->zap_pid;
+    t->zap_pid = 0;
+    t->user_type = USER_STOPPING;
+    unsigned long transition = next_generation(t);
+    pthread_mutex_unlock(&tuner_mutex);
+
+    int stopped = terminate_process(pid);
+    if (!stopped) schedule_reaper(t, transition, pid);
+
+    pthread_mutex_lock(&tuner_mutex);
+    if (t->generation == transition && t->user_type == USER_STOPPING) {
+        if (stopped) {
+            t->in_use = 0;
+            t->user_type = USER_NONE;
+            next_generation(t);
+        } else {
+            t->zap_pid = pid;
+            LOG_ERROR("TUNER", "Process %d did not stop; tuner %d quarantined",
+                      pid, t->id);
+        }
     }
-    
-    t->in_use = 0;
-    t->user_type = USER_NONE;
-    next_generation(t);
-    
     pthread_mutex_unlock(&tuner_mutex);
 }

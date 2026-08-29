@@ -3,6 +3,21 @@
 
 #include "stream_config.h"
 
+static void assert_request_ok(const char *path, const char *query,
+                              StreamConfig *config) {
+    char error[160];
+    assert(stream_config_parse_request(path, query, config, error,
+                                       sizeof(error)));
+}
+
+static void assert_request_rejected(const char *path, const char *query) {
+    StreamConfig config;
+    char error[160];
+    assert(!stream_config_parse_request(path, query, &config, error,
+                                        sizeof(error)));
+    assert(error[0] != '\0');
+}
+
 int main(void) {
     char channel[64];
     TranscodeContainer path_container;
@@ -87,5 +102,28 @@ int main(void) {
     assert(parse_container("mpegts") == OUTPUT_MPEGTS);
     assert(parse_latency("robust") == LATENCY_ROBUST);
     assert(parse_latency("fastest") == LATENCY_INVALID);
+
+    StreamConfig request;
+    assert_request_ok("21.2", NULL, &request);
+    assert(request.container == OUTPUT_MPEGTS);
+    assert_request_ok("21.2.ts", "latency=low&codec=copy", &request);
+    assert(request.latency == LATENCY_LOW);
+    assert_request_ok("21.2.mkv", "codec=h264&backend=software", &request);
+    assert(request.container == OUTPUT_MATROSKA);
+    assert_request_ok("21.2.ts", "codec=h265&audio=5.1&bitrate=8000",
+                      &request);
+    assert(request.codec == CODEC_HEVC);
+    assert(request.audio_channels == 6);
+
+    assert_request_rejected("21.2.ts", "unknown=value");
+    assert_request_rejected("21.2.ts", "latency=low&latency=robust");
+    assert_request_rejected("21.2.ts", "latency=");
+    assert_request_rejected("21.2.ts", "latency");
+    assert_request_rejected("21.2.ts", "latency=%00low");
+    assert_request_rejected("21.2.ts", "latency=%0dlow");
+    assert_request_rejected("21.2.ts", "latency=%zz");
+    assert_request_rejected("21.2.ts", "latency=low&");
+    assert_request_rejected("21.2.ts", "container=mkv");
+    assert_request_rejected("21.2.ts", "codec=av1&backend=software");
     return 0;
 }

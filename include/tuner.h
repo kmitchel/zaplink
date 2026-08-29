@@ -20,7 +20,8 @@
 typedef enum {
     USER_NONE = 0,   /**< Tuner is idle */
     USER_STREAM,     /**< Live streaming (highest priority) */
-    USER_EPG         /**< EPG data collection (can be preempted) */
+    USER_EPG,        /**< EPG data collection (can be preempted) */
+    USER_STOPPING    /**< Child termination is in progress */
 } TunerUser;
 
 /**

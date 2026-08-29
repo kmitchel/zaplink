@@ -42,7 +42,10 @@ static pthread_mutex_t g_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
 void build_channel_lookup();
 
 int db_init() {
-    int rc = sqlite3_open_v2(DB_PATH, &db,
+    const char *configured_path = getenv("ZAPLINK_DB_PATH");
+    const char *database_path = configured_path && *configured_path
+        ? configured_path : DB_PATH;
+    int rc = sqlite3_open_v2(database_path, &db,
                              SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE |
                              SQLITE_OPEN_FULLMUTEX, NULL);
     if (rc) {
@@ -126,6 +129,7 @@ void db_invalidate_cache() {
 
 // Helper to append to dynamic string. Returns 1 on success, 0 on OOM.
 int append_str(char **dest, size_t *size, size_t *cap, const char *src) {
+    if (!dest || !*dest || !size || !cap || !src) return 0;
     size_t len = strlen(src);
     if (*size + len + 1 > *cap) {
         size_t new_cap = (*size + len + 1) * 2;

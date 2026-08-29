@@ -26,6 +26,13 @@ static const char *get_arg_val(char **args, const char *flag) {
     return NULL;
 }
 
+static int arg_index(char **args, const char *target) {
+    for (int index = 0; args && args[index]; index++) {
+        if (strcmp(args[index], target) == 0) return index;
+    }
+    return -1;
+}
+
 static void test_copy_stream(void) {
     StreamConfig config;
     stream_config_init(&config);
@@ -113,6 +120,7 @@ static void test_qsv_backend(void) {
     assert(has_arg(args, "h264_qsv"));
     assert(has_arg(args, "vpp_qsv=deinterlace=2"));
     assert(strcmp(get_arg_val(args, "-hwaccel"), "qsv") == 0);
+    assert(arg_index(args, "-hwaccel") < arg_index(args, "-i"));
 }
 
 static void test_nvenc_backend(void) {
@@ -130,6 +138,7 @@ static void test_nvenc_backend(void) {
     assert(has_arg(args, "hevc_nvenc"));
     assert(has_arg(args, "yadif_cuda=0:-1:1"));
     assert(strcmp(get_arg_val(args, "-hwaccel"), "cuda") == 0);
+    assert(arg_index(args, "-hwaccel") < arg_index(args, "-i"));
 }
 
 static void test_vaapi_backend(void) {
@@ -147,6 +156,8 @@ static void test_vaapi_backend(void) {
     assert(has_arg(args, "h264_vaapi"));
     assert(has_arg(args, "deinterlace_vaapi"));
     assert(strcmp(get_arg_val(args, "-hwaccel"), "vaapi") == 0);
+    assert(arg_index(args, "-init_hw_device") < arg_index(args, "-i"));
+    assert(arg_index(args, "-hwaccel") < arg_index(args, "-i"));
 }
 
 static void test_latency_profiles(void) {

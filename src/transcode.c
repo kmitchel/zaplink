@@ -8,6 +8,7 @@
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
+#include <spawn.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,9 +27,13 @@
 
 typedef struct {
     pid_t process_group;
+    pid_t zap_pid;
+    pid_t ffmpeg_pid;
     Tuner *tuner;
     unsigned long lease_generation;
 } PipelineContext;
+
+extern char **environ;
 
 static pthread_once_t session_init_once = PTHREAD_ONCE_INIT;
 static int sessions_ready;
@@ -74,17 +79,68 @@ static int64_t monotonic_milliseconds(void) {
     return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
 }
 
-static void terminate_process_group(pid_t pid) {
-    if (pid <= 0) return;
-    kill(-pid, SIGTERM);
-    int status;
-    for (int attempt = 0; attempt < 20; attempt++) {
-        pid_t result = waitpid(pid, &status, WNOHANG);
-        if (result == pid || (result < 0 && errno == ECHILD)) return;
+static int reap_process(pid_t pid, int attempts, int *status) {
+    if (pid <= 0) return 1;
+    for (int attempt = 0; attempt < attempts; attempt++) {
+        pid_t result = waitpid(pid, status, WNOHANG);
+        if (result == pid || (result < 0 && errno == ECHILD)) return 1;
+        if (result < 0 && errno != EINTR) return 0;
         usleep(50000);
     }
-    kill(-pid, SIGKILL);
-    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+    return 0;
+}
+
+static int terminate_process_group(PipelineContext *context) {
+    if (!context || context->process_group <= 0) return 1;
+    int zap_status = 0;
+    int ffmpeg_status = 0;
+    int zap_done = reap_process(context->zap_pid, 1, &zap_status);
+    int ffmpeg_done = reap_process(context->ffmpeg_pid, 1, &ffmpeg_status);
+    if (!zap_done || !ffmpeg_done) kill(-context->process_group, SIGTERM);
+    if (!zap_done) zap_done = reap_process(context->zap_pid, 10, &zap_status);
+    if (!ffmpeg_done) {
+        ffmpeg_done = reap_process(context->ffmpeg_pid, 10, &ffmpeg_status);
+    }
+    if (!zap_done || !ffmpeg_done) kill(-context->process_group, SIGKILL);
+    if (!zap_done) zap_done = reap_process(context->zap_pid, 10, &zap_status);
+    if (!ffmpeg_done) {
+        ffmpeg_done = reap_process(context->ffmpeg_pid, 10, &ffmpeg_status);
+    }
+    return zap_done && ffmpeg_done;
+}
+
+static void wait_for_pipeline_child(pid_t pid) {
+    if (pid <= 0) return;
+    int status;
+    pid_t result;
+    do {
+        result = waitpid(pid, &status, 0);
+    } while (result < 0 && errno == EINTR);
+}
+
+static void *reap_pipeline(void *opaque) {
+    PipelineContext *context = opaque;
+    wait_for_pipeline_child(context->zap_pid);
+    wait_for_pipeline_child(context->ffmpeg_pid);
+    tuner_clear_process(context->tuner, context->lease_generation,
+                        context->zap_pid);
+    release_tuner(context->tuner, context->lease_generation);
+    LOG_INFO("TRANSCODE", "Quarantined pipeline group %d was reaped",
+             context->process_group);
+    free(context);
+    return NULL;
+}
+
+static int schedule_pipeline_reaper(PipelineContext *context) {
+    pthread_t reaper;
+    int result = pthread_create(&reaper, NULL, reap_pipeline, context);
+    if (result != 0) {
+        LOG_ERROR("TRANSCODE", "Unable to monitor pipeline group %d: %s",
+                  context->process_group, strerror(result));
+        return 0;
+    }
+    pthread_detach(reaper);
+    return 1;
 }
 
 static void add_arg(char **arguments, int *count, const char *argument, int *error) {
@@ -98,7 +154,7 @@ static void add_arg(char **arguments, int *count, const char *argument, int *err
 }
 
 static const char *find_vaapi_device(void) {
-    static char device[64];
+    static _Thread_local char device[64];
     glob_t matches;
     if (glob("/dev/dri/renderD*", GLOB_NOSORT, NULL, &matches) != 0) {
         return "/dev/dri/renderD128";
@@ -293,109 +349,185 @@ void build_ffmpeg_arguments(const StreamConfig *config,
     add_arg(arguments, &count, "-", argument_error);
 }
 
+static int initialize_spawn_attributes(posix_spawnattr_t *attributes,
+                                       pid_t process_group) {
+    int result = posix_spawnattr_init(attributes);
+    if (result != 0) return result;
+    sigset_t defaults;
+    sigemptyset(&defaults);
+    sigaddset(&defaults, SIGINT);
+    sigaddset(&defaults, SIGTERM);
+    sigaddset(&defaults, SIGPIPE);
+    result = posix_spawnattr_setsigdefault(attributes, &defaults);
+    if (result == 0) {
+        result = posix_spawnattr_setpgroup(attributes, process_group);
+    }
+    if (result == 0) {
+        result = posix_spawnattr_setflags(
+            attributes, POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_SETSIGDEF);
+    }
+    if (result != 0) posix_spawnattr_destroy(attributes);
+    return result;
+}
+
+static int add_pipeline_actions(posix_spawn_file_actions_t *actions,
+                                int input_fd, int output_fd,
+                                const int pipes[4]) {
+    int result = posix_spawn_file_actions_init(actions);
+    if (result != 0) return result;
+    if (input_fd >= 0) {
+        result = posix_spawn_file_actions_adddup2(actions, input_fd,
+                                                   STDIN_FILENO);
+    }
+    if (result == 0 && output_fd >= 0) {
+        result = posix_spawn_file_actions_adddup2(actions, output_fd,
+                                                   STDOUT_FILENO);
+    }
+    for (int index = 0; result == 0 && index < 4; index++) {
+        result = posix_spawn_file_actions_addclose(actions, pipes[index]);
+    }
+    if (result != 0) posix_spawn_file_actions_destroy(actions);
+    return result;
+}
+
+static void close_pipeline_pipes(int zap_pipe[2], int output_pipe[2]) {
+    for (int index = 0; index < 2; index++) {
+        if (zap_pipe[index] >= 0) close(zap_pipe[index]);
+        if (output_pipe[index] >= 0) close(output_pipe[index]);
+        zap_pipe[index] = output_pipe[index] = -1;
+    }
+}
+
 static int start_pipeline(const StreamConfig *config, StreamProducer *producer) {
-    if (!validate_channel_id(config->channel_num)) return -1;
+    if (!validate_channel_id(config->channel_num)) {
+        snprintf(producer->error, sizeof(producer->error),
+                 "Invalid channel identifier");
+        return -1;
+    }
     Channel *channel = find_channel_by_id(config->channel_num);
-    if (!channel) return -1;
+    if (!channel) {
+        snprintf(producer->error, sizeof(producer->error), "Channel not found");
+        return -1;
+    }
+
+    char *ffmpeg_arguments[128] = {0};
+    int argument_error = 0;
+    build_ffmpeg_arguments(config, ffmpeg_arguments, &argument_error);
+    if (argument_error) {
+        snprintf(producer->error, sizeof(producer->error),
+                 "FFmpeg argument list exceeds the supported limit");
+        return -1;
+    }
 
     unsigned long lease_generation = 0;
     Tuner *tuner = acquire_tuner(USER_STREAM, &lease_generation);
-    if (!tuner) return -1;
+    if (!tuner) {
+        snprintf(producer->error, sizeof(producer->error),
+                 "No tuner is currently available");
+        return -1;
+    }
 
     int zap_pipe[2] = {-1, -1};
     int output_pipe[2] = {-1, -1};
-    if (pipe(zap_pipe) < 0 || pipe(output_pipe) < 0) {
-        if (zap_pipe[0] >= 0) close(zap_pipe[0]);
-        if (zap_pipe[1] >= 0) close(zap_pipe[1]);
-        if (output_pipe[0] >= 0) close(output_pipe[0]);
-        if (output_pipe[1] >= 0) close(output_pipe[1]);
+    if (pipe2(zap_pipe, O_CLOEXEC) < 0 || pipe2(output_pipe, O_CLOEXEC) < 0) {
+        int saved_errno = errno;
+        close_pipeline_pipes(zap_pipe, output_pipe);
         release_tuner(tuner, lease_generation);
+        snprintf(producer->error, sizeof(producer->error),
+                 "Unable to create stream pipes: %s", strerror(saved_errno));
         return -1;
     }
-
-    pid_t group = fork();
-    if (group < 0) {
-        close(zap_pipe[0]); close(zap_pipe[1]);
-        close(output_pipe[0]); close(output_pipe[1]);
-        release_tuner(tuner, lease_generation);
-        return -1;
-    }
-
-    if (group == 0) {
-        if (setpgid(0, 0) < 0) _exit(1);
-        signal(SIGINT, SIG_DFL);
-        signal(SIGTERM, SIG_DFL);
-
-        /* Pipeline shutdown closes pipes by design. Keep the resulting
-         * dvbv5-zap/FFmpeg diagnostics out of normal service logs, matching
-         * the historical non-verbose behavior. */
-        if (!g_verbose) {
-            int devnull = open("/dev/null", O_WRONLY);
-            if (devnull >= 0) {
-                dup2(devnull, STDERR_FILENO);
-                close(devnull);
-            }
-        }
-
-        pid_t zap = fork();
-        if (zap == 0) {
-            close(output_pipe[0]); close(output_pipe[1]); close(zap_pipe[0]);
-            dup2(zap_pipe[1], STDOUT_FILENO);
-            close(zap_pipe[1]);
-            char adapter[16];
-            snprintf(adapter, sizeof(adapter), "%d", tuner->id);
-            execlp("dvbv5-zap", "dvbv5-zap", "-c", channels_conf_path,
-                   "-a", adapter, "-p", "-o", "-", channel->number, NULL);
-            _exit(1);
-        }
-        if (zap < 0) _exit(1);
-
-        pid_t ffmpeg = fork();
-        if (ffmpeg == 0) {
-            close(output_pipe[0]); close(zap_pipe[1]);
-            dup2(zap_pipe[0], STDIN_FILENO);
-            dup2(output_pipe[1], STDOUT_FILENO);
-            close(zap_pipe[0]); close(output_pipe[1]);
-            char *arguments[128] = {0};
-            int argument_error = 0;
-            build_ffmpeg_arguments(config, arguments, &argument_error);
-            if (argument_error) _exit(1);
-            execvp("ffmpeg", arguments);
-            _exit(1);
-        }
-        close(zap_pipe[0]); close(zap_pipe[1]);
-        close(output_pipe[0]); close(output_pipe[1]);
-        if (ffmpeg < 0) {
-            kill(zap, SIGTERM);
-            waitpid(zap, NULL, 0);
-            _exit(1);
-        }
-        waitpid(zap, NULL, 0);
-        waitpid(ffmpeg, NULL, 0);
-        _exit(0);
-    }
-
-    if (setpgid(group, group) < 0 && errno != EACCES && errno != ESRCH) {
-        LOG_WARN("TRANSCODE", "Unable to set process group %d: %s", group, strerror(errno));
-    }
-    close(zap_pipe[0]); close(zap_pipe[1]); close(output_pipe[1]);
 
     PipelineContext *context = calloc(1, sizeof(*context));
     if (!context) {
-        close(output_pipe[0]);
-        terminate_process_group(group);
+        close_pipeline_pipes(zap_pipe, output_pipe);
         release_tuner(tuner, lease_generation);
+        snprintf(producer->error, sizeof(producer->error),
+                 "Unable to allocate stream pipeline state");
         return -1;
     }
-    context->process_group = group;
     context->tuner = tuner;
     context->lease_generation = lease_generation;
+
+    int all_pipes[4] = {zap_pipe[0], zap_pipe[1],
+                        output_pipe[0], output_pipe[1]};
+    char adapter[16];
+    snprintf(adapter, sizeof(adapter), "%d", tuner->id);
+    char *zap_arguments[] = {
+        "dvbv5-zap", "-c", channels_conf_path, "-a", adapter,
+        "-p", "-o", "-", channel->number, NULL
+    };
+
+    posix_spawn_file_actions_t zap_actions;
+    posix_spawnattr_t zap_attributes;
+    int spawn_error = add_pipeline_actions(&zap_actions, -1, zap_pipe[1],
+                                           all_pipes);
+    int zap_actions_ready = spawn_error == 0;
+    if (spawn_error == 0) {
+        spawn_error = initialize_spawn_attributes(&zap_attributes, 0);
+    }
+    if (spawn_error == 0) {
+        spawn_error = posix_spawnp(&context->zap_pid, "dvbv5-zap",
+                                   &zap_actions, &zap_attributes,
+                                   zap_arguments, environ);
+        posix_spawnattr_destroy(&zap_attributes);
+    }
+    if (zap_actions_ready) posix_spawn_file_actions_destroy(&zap_actions);
+    if (spawn_error != 0) {
+        close_pipeline_pipes(zap_pipe, output_pipe);
+        release_tuner(tuner, lease_generation);
+        snprintf(producer->error, sizeof(producer->error),
+                 "Unable to start dvbv5-zap: %s", strerror(spawn_error));
+        free(context);
+        return -1;
+    }
+    context->process_group = context->zap_pid;
+    if (!tuner_set_process(tuner, lease_generation, context->zap_pid)) {
+        int stopped = terminate_process_group(context);
+        close_pipeline_pipes(zap_pipe, output_pipe);
+        snprintf(producer->error, sizeof(producer->error),
+                 "Tuner lease expired while starting dvbv5-zap");
+        if (stopped || !schedule_pipeline_reaper(context)) free(context);
+        return -1;
+    }
+
+    posix_spawn_file_actions_t ffmpeg_actions;
+    posix_spawnattr_t ffmpeg_attributes;
+    spawn_error = add_pipeline_actions(&ffmpeg_actions, zap_pipe[0],
+                                       output_pipe[1], all_pipes);
+    int ffmpeg_actions_ready = spawn_error == 0;
+    if (spawn_error == 0) {
+        spawn_error = initialize_spawn_attributes(&ffmpeg_attributes,
+                                                  context->process_group);
+    }
+    if (spawn_error == 0) {
+        spawn_error = posix_spawnp(&context->ffmpeg_pid, "ffmpeg",
+                                   &ffmpeg_actions, &ffmpeg_attributes,
+                                   ffmpeg_arguments, environ);
+        posix_spawnattr_destroy(&ffmpeg_attributes);
+    }
+    if (ffmpeg_actions_ready) posix_spawn_file_actions_destroy(&ffmpeg_actions);
+    close(zap_pipe[0]); zap_pipe[0] = -1;
+    close(zap_pipe[1]); zap_pipe[1] = -1;
+    close(output_pipe[1]); output_pipe[1] = -1;
+    if (spawn_error != 0) {
+        int stopped = terminate_process_group(context);
+        if (stopped) {
+            tuner_clear_process(tuner, lease_generation, context->zap_pid);
+            release_tuner(tuner, lease_generation);
+        }
+        close(output_pipe[0]);
+        snprintf(producer->error, sizeof(producer->error),
+                 "Unable to start FFmpeg: %s", strerror(spawn_error));
+        if (stopped || !schedule_pipeline_reaper(context)) free(context);
+        return -1;
+    }
+
     producer->fd = output_pipe[0];
     producer->opaque = context;
-    LOG_INFO("TRANSCODE",
-             "Producer started: channel=%s codec=%d backend=%d container=%s adapter=%d",
-             config->channel_num, config->codec, config->backend,
-             stream_config_extension(config), tuner->id);
+    LOG_INFO("TRANSCODE", "Pipeline launched: channel=%s zap_pid=%d ffmpeg_pid=%d adapter=%d",
+             config->channel_num, context->zap_pid, context->ffmpeg_pid,
+             tuner->id);
     return 0;
 }
 
@@ -406,11 +538,24 @@ static void stop_pipeline(StreamProducer *producer) {
         producer->fd = -1;
     }
     PipelineContext *context = producer->opaque;
+    int context_owned_by_reaper = 0;
     if (context) {
-        terminate_process_group(context->process_group);
-        release_tuner(context->tuner, context->lease_generation);
-        LOG_INFO("TRANSCODE", "Producer stopped (group=%d)", context->process_group);
-        free(context);
+        int stopped = terminate_process_group(context);
+        if (stopped) {
+            tuner_clear_process(context->tuner, context->lease_generation,
+                                context->zap_pid);
+            release_tuner(context->tuner, context->lease_generation);
+            LOG_INFO("TRANSCODE", "Pipeline stopped (group=%d)",
+                     context->process_group);
+        } else {
+            snprintf(producer->error, sizeof(producer->error),
+                     "Stream processes did not terminate within the safety deadline");
+            LOG_ERROR("TRANSCODE",
+                      "Pipeline group %d did not terminate; tuner %d remains reserved",
+                      context->process_group, context->tuner->id);
+            context_owned_by_reaper = schedule_pipeline_reaper(context);
+        }
+        if (!context_owned_by_reaper) free(context);
     }
     producer->opaque = NULL;
 }

@@ -64,6 +64,14 @@ int stream_config_parse_channel_path(const char *path,
                                      size_t channel_size,
                                      TranscodeContainer *path_container);
 
+/* Parse and normalize one stream request. Unknown, duplicate, malformed, and
+ * conflicting parameters are rejected with a user-facing error message. */
+int stream_config_parse_request(const char *channel_path,
+                                const char *query,
+                                StreamConfig *config,
+                                char *error,
+                                size_t error_size);
+
 const char *stream_config_extension(const StreamConfig *config);
 const char *stream_config_mime_type(const StreamConfig *config);
 const char *stream_latency_name(StreamLatency latency);

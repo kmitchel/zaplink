@@ -111,25 +111,25 @@ static int producer_should_stop(StreamSession *session) {
 
 static void *producer_thread(void *argument) {
     StreamSession *session = argument;
-    StreamProducer producer = { .fd = -1, .opaque = NULL };
+    StreamProducer producer = { .fd = -1, .opaque = NULL, .error = "" };
     if (producer_ops.start(&session->config, &producer) != 0 || producer.fd < 0) {
         if (producer.fd >= 0 || producer.opaque) producer_ops.stop(&producer);
-        set_stopped(session, "Unable to start stream producer");
+        set_stopped(session, producer.error[0]
+                    ? producer.error : "Unable to start stream producer");
         return NULL;
     }
 
-    pthread_mutex_lock(&sessions_mutex);
-    if (session->state == SESSION_STARTING) session->state = SESSION_RUNNING;
-    pthread_cond_broadcast(&session->data_ready);
-    pthread_mutex_unlock(&sessions_mutex);
-
     unsigned char buffer[65536];
     int ended = 0;
+    int requested_stop = 0;
     while (!ended) {
         pthread_mutex_lock(&sessions_mutex);
         int stop = producer_should_stop(session);
         pthread_mutex_unlock(&sessions_mutex);
-        if (stop) break;
+        if (stop) {
+            requested_stop = 1;
+            break;
+        }
 
         struct pollfd descriptor = { .fd = producer.fd, .events = POLLIN };
         int result = poll(&descriptor, 1, PRODUCER_POLL_MS);
@@ -143,9 +143,15 @@ static void *producer_thread(void *argument) {
             ssize_t bytes = read(producer.fd, buffer, sizeof(buffer));
             if (bytes > 0) {
                 pthread_mutex_lock(&sessions_mutex);
+                int became_ready = session->state == SESSION_STARTING;
+                if (became_ready) session->state = SESSION_RUNNING;
                 write_ring(session, buffer, (size_t)bytes);
                 pthread_cond_broadcast(&session->data_ready);
                 pthread_mutex_unlock(&sessions_mutex);
+                if (became_ready) {
+                    LOG_INFO("SESSION", "Producer ready for %s",
+                             session->config.channel_num);
+                }
             } else if (bytes == 0 || errno != EINTR) {
                 ended = 1;
             }
@@ -164,7 +170,9 @@ static void *producer_thread(void *argument) {
     }
 
     producer_ops.stop(&producer);
-    set_stopped(session, NULL);
+    set_stopped(session, requested_stop ? NULL :
+                (producer.error[0] ? producer.error
+                                   : "Stream producer ended unexpectedly"));
     return NULL;
 }
 

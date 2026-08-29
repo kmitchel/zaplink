@@ -8,6 +8,7 @@ BUILD_DIR = build
 OBJ_DIR = $(BUILD_DIR)/obj
 
 INSTALL_DIR = /opt/zaplink
+STATE_DIR = /var/lib/zaplink
 SERVICE_DIR = /etc/systemd/system
 
 SRCS = $(SRC_DIR)/main.c $(SRC_DIR)/channels.c $(SRC_DIR)/db.c $(SRC_DIR)/epg.c \
@@ -70,21 +71,22 @@ test: $(TARGET) $(TEST_TARGETS)
 	$(BUILD_DIR)/test_stream_session
 	$(BUILD_DIR)/test_transcode
 	$(BUILD_DIR)/test_huffman
+	tests/test_http_contract.sh
 
 http-contract-test: $(TARGET)
-	tests/test_http_contract.sh "$${ZAPLINK_TEST_BASE_URL:-http://127.0.0.1:18392}" "$${ZAPLINK_TEST_CHANNEL:-15.1}" "$${ZAPLINK_TEST_SERVER_PID:-}"
+	tests/test_http_contract.sh
 
 install: $(TARGET)
 	@echo "Installing ZapLink..."
-	@mkdir -p $(INSTALL_DIR)
 	@if ! id -u zaplink > /dev/null 2>&1; then \
 		useradd -r -s /usr/sbin/nologin zaplink; \
 	fi
+	install -d -o root -g root -m 755 $(INSTALL_DIR)
+	install -d -o zaplink -g zaplink -m 750 $(STATE_DIR)
 	@if getent group video >/dev/null; then usermod -aG video zaplink; fi
 	@if getent group render >/dev/null; then usermod -aG render zaplink; fi
-	cp -f $(TARGET) $(INSTALL_DIR)/zaplink
-	cp -n huffman.bin $(INSTALL_DIR)/ || true
-	chown -R zaplink:zaplink $(INSTALL_DIR)
+	install -o root -g root -m 755 $(TARGET) $(INSTALL_DIR)/zaplink
+	install -o root -g root -m 644 huffman.bin $(INSTALL_DIR)/huffman.bin
 	install -Dm644 support/zaplink.service $(SERVICE_DIR)/zaplink.service
 	systemctl enable zaplink.service
 	systemctl daemon-reload

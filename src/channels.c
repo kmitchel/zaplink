@@ -150,14 +150,20 @@ int load_channels(const char *filename) {
         qsort(channels, channel_count, sizeof(Channel), compare_channels);
     }
 
-    /* Precompute unique IDs for O(1) retrieval */
+    /* Cache the canonical ID used consistently by every output surface. */
     for (int i = 0; i < channel_count; i++) {
+        char number[sizeof(channels[i].number)];
+        char frequency[sizeof(channels[i].frequency)];
+        char service_id[sizeof(channels[i].service_id)];
+        memcpy(number, channels[i].number, sizeof(number));
+        memcpy(frequency, channels[i].frequency, sizeof(frequency));
+        memcpy(service_id, channels[i].service_id, sizeof(service_id));
         if (is_vcn_duplicated(channels[i].number)) {
             snprintf(channels[i].unique_id, sizeof(channels[i].unique_id), "%s-%s-%s",
-                     channels[i].number, channels[i].frequency, channels[i].service_id);
+                     number, frequency, service_id);
         } else {
             snprintf(channels[i].unique_id, sizeof(channels[i].unique_id), "%s",
-                     channels[i].number);
+                     number);
         }
     }
 

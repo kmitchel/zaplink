@@ -6,8 +6,8 @@ ZapLink is a lightweight ATSC/DVB backend that scans channels, builds an EPG fro
 
 ZapLink has been hardened for production environments:
 
--   **Shell Removal**: The transcoding pipeline uses direct `fork`/`execvp` calls, eliminating shell injection vulnerabilities associated with `system()` or `popen()`.
--   **Argument Safety**: STRICT enforcement of argument limits (128) prevents buffer overflow attacks. The system aborts execution if command line arguments exceed safe limits.
+-   **Shell Removal**: The transcoding pipeline uses `posix_spawnp()` with explicit file actions and argument arrays, avoiding both shell injection and unsafe post-`fork()` setup in the multithreaded server.
+-   **Argument Safety**: FFmpeg argument construction has a fixed 128-entry limit and refuses to launch a partial command if that limit is exceeded.
 -   **HTTP Robustness**: The request parser enforces 4KB headers, a 10-second header deadline, bounded pending connections, exact query parsing, and strict parameter ranges.
 -   **Bounded Streaming**: Pipelines that produce no data or stall for 15 seconds are terminated and return an HTTP error when possible.
 
@@ -16,7 +16,7 @@ ZapLink has been hardened for production environments:
 - **Reliable Device Startup**: Waits up to 30 seconds for USB DVB frontends before scanning or serving streams.
 - **Weak-Signal Filtering**: Measures each scanned multiplex and comments out channels below 20 dB C/N unless explicitly retained.
 - **Robust EPG**: Low-overhead background EPG collection with valid XMLTV output supporting Jellyfin Series Recording and bounded memory footprint.
-- **Fast Channel Lookups**: Precomputed O(1) channel identifiers for rapid dispatch and collision-free subchannel routing.
+- **Stable Channel Identity**: Precomputed collision-free identifiers keep playlist, XMLTV, and stream routing consistent.
 - **Live Streaming**: Supports software and hardware transcoding (QSV, VAAPI, NVENC) via FFmpeg.
 - **Fast Stream Handoffs**: Compatible MPEG-TS requests share one normalized producer and remain warm briefly across probe-to-playback reconnects.
 - **Simple API**: HTTP endpoints for M3U playlists and XMLTV guide data.
@@ -54,9 +54,15 @@ sudo make install
 - Create a `zaplink` user.
 - Install and enable the `zaplink.service`.
 - Add the service account to available `video` and `render` groups.
-- Install a hardened unit with `/opt/zaplink` as its only writable system path.
+- Create `/var/lib/zaplink` for mutable EPG state.
+- Install a hardened unit that keeps `/opt/zaplink` read-only to the service and permits writes only below `/var/lib/zaplink`.
 
-**Note:** `channels.conf` is *not* overwritten or installed by default to prevent valid configs from being lost. Use the `-s` flag to generate it if missing, or copy it manually if you have a backup.
+The binary, unit, and static assets are installed as `root:root`. Do not make
+the executable or rollback copies writable by the `zaplink` service account.
+
+**Note:** `channels.conf` is *not* overwritten or installed by default, to
+protect an existing tuner configuration. Before the first packaged-service
+start, copy or scan it into `/var/lib/zaplink/channels.conf`.
 
 ## Usage
 
@@ -87,7 +93,8 @@ You can run the binary directly for testing:
 Flags:
 - `-p <port>`: HTTP port (default `18392`).
 - `-v`: Verbose logging.
-- `-n`: Disable the background EPG engine.
+- `-e`: Explicitly enable periodic EPG tuner scans. Scanning is disabled by default.
+- `-n`: Disable the EPG database and XMLTV endpoint entirely.
 - `-t`: Run transcoding benchmark.
 - `-s`: Force channel rescan.
 - `-h`: Show command-line help.
@@ -118,6 +125,21 @@ sudo systemctl restart zaplink
 The `zaplink` account must have read/write access to the frontend, demux, and DVR
 nodes, typically through membership in the `video` group.
 
+### EPG Operation
+
+The XMLTV database and periodic tuner scanner are separate concerns. ZapLink
+opens the database and serves `/xmltv.xml` by default, but it does not reserve a
+tuner for periodic EPG collection unless started with `-e`. This is appropriate
+when guide data is populated externally or the host must reserve all tuners for
+viewing and recording. Add `-e` to `ExecStart` only when ZapLink should collect
+PSIP guide data itself. Use `-n` when neither the database nor XMLTV endpoint is
+needed.
+
+The packaged service stores `epg.db` and `channels.conf` below
+`/var/lib/zaplink` through `ZAPLINK_DB_PATH` and `ZAPLINK_CHANNELS_PATH`. Manual
+runs without those variables continue using the current directory for
+compatibility.
+
 ### Channel Scanning and Signal Filtering
 
 The interactive scanner can be run from the installed directory. Stop the
@@ -128,7 +150,7 @@ after any scan failure and is replaced atomically only after success:
 ```sh
 sudo systemctl stop zaplink
 cd /opt/zaplink
-sudo -u zaplink ./zaplink -s
+sudo -u zaplink env ZAPLINK_CHANNELS_PATH=/var/lib/zaplink/channels.conf ./zaplink -s
 sudo systemctl start zaplink
 ```
 
@@ -184,7 +206,9 @@ frequency/service-qualified ID such as `15.1-581000000-3`. Requests using an
 ambiguous bare number are rejected instead of silently tuning the first match.
 
 ### Streaming Parameters
-All parameters are optional and can be appended to stream URLs or the playlist URL.
+All parameters are optional and can be appended to stream URLs or the playlist
+URL. Names are case-sensitive. Unknown, duplicate, empty, malformed percent-
+encoded, and control-character-containing parameters receive HTTP 400.
 
 | Parameter | Values | Default | Description |
 |-----------|--------|---------|-------------|
@@ -228,6 +252,10 @@ by playback can therefore reuse the tuned stream instead of consuming another
 tuner and restarting FFmpeg. A different transcoding profile still requires a
 separate producer. Matroska is not joined in progress because new subscribers
 would not receive its required initial container header.
+
+For `codec=copy`, backend, bitrate, and audio settings cannot affect the copied
+transport and are canonicalized away. Compatibility URLs that differ only in
+those irrelevant values intentionally share the same passthrough session.
 
 ### Streaming Modes
 
@@ -326,15 +354,16 @@ The response should report `Content-Type: video/mp2t` and
 distinguish a newly created producer from a reused one. If identical requests
 create separate producers, confirm that every media-affecting option is equal;
 different bitrate, audio, codec, backend, container, or latency values are
-intentionally isolated.
+intentionally isolated when they affect the selected mode. In passthrough mode,
+backend, bitrate, and audio are ignored and therefore do not isolate sessions.
 
 ## Verification
 
-Run the build and regression test suite covering channel identity, precomputed
-unique IDs, tuner lease preemption, concurrent EPG database transactions, stream
-profile normalization, shared delivery, linger cleanup, producer-start failure
-recovery, FFmpeg argument generation across backends, and ATSC A/65 Huffman
-decoding with:
+Run the build and regression suite covering channel identity, tuner lease
+preemption without lock-held waits, concurrent EPG database transactions,
+strict profile parsing, concurrent shared delivery, session isolation and
+exhaustion, ring-buffer overrun, linger cleanup, producer failures, FFmpeg
+argument ordering, hermetic HTTP GET/HEAD behavior, and ATSC A/65 Huffman decoding:
 
 ```sh
 make test
@@ -346,9 +375,26 @@ mpv "http://falcon:18392/playlist.m3u?backend=qsv&codec=h264"
 ```
 
 ## Data Files
-- `channels.conf`: Generated by the scanner and stored in `/opt/zaplink/` or the current working directory.
-- `epg.db`: SQLite database for EPG storage.
+- `/var/lib/zaplink/channels.conf`: Channel configuration used by the packaged service.
+- `/var/lib/zaplink/epg.db`: SQLite EPG database used by the packaged service.
 - `huffman.bin`: Required for decoding certain ATSC EPG strings.
+
+## Safe Upgrade and Rollback
+
+Before replacing a running installation, confirm that no stream, recording, or
+EPG scan is active. Save both the binary and the effective systemd unit with
+root-only ownership; a binary-only rollback is insufficient when service flags
+or writable paths change. Stop the service, migrate an existing
+`/opt/zaplink/epg.db` and `/opt/zaplink/channels.conf` into `/var/lib/zaplink`
+if required, install the new binary and unit, run `systemctl daemon-reload`,
+and start the service. Verify
+ownership, endpoints, strict parameter rejection, and logs before deleting any
+rollback files.
+
+If verification fails, stop the service, restore both saved files, reload
+systemd, restart ZapLink, and verify the restored endpoints and process tree.
+Rollback artifacts should remain `root:root` and mode `0755` for binaries or
+`0644` for units.
 
 ## Notes
 - **Series Recording**: The generated XMLTV includes special tags (`<episode-num>`, `<category>Series</category>`) to ensure Jellyfin recognizes recurring shows.

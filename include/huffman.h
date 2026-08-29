@@ -41,12 +41,12 @@ typedef struct {
  * Loads huffman.bin from the current working directory
  * @return 1 on success, 0 on failure (file not found, parse error)
  */
-int huffman_init();
+int huffman_init(void);
 
 /**
  * Clean up Huffman decoder resources
  */
-void huffman_cleanup();
+void huffman_cleanup(void);
 
 /**
  * Decode an ATSC Huffman-compressed text segment

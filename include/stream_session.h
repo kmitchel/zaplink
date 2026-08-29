@@ -12,6 +12,7 @@ typedef struct StreamSession StreamSession;
 typedef struct {
     int fd;
     void *opaque;
+    char error[256];
 } StreamProducer;
 
 typedef struct {

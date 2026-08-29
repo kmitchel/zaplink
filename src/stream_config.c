@@ -1,6 +1,11 @@
+#include <ctype.h>
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 
+#include "config.h"
 #include "stream_config.h"
 
 void stream_config_init(StreamConfig *config) {
@@ -138,6 +143,178 @@ int stream_config_parse_channel_path(const char *path,
     if (channel_length == 0 || channel_length >= channel_size) return 0;
     memcpy(channel, path, channel_length);
     channel[channel_length] = '\0';
+    return 1;
+}
+
+enum QueryField {
+    QUERY_BACKEND,
+    QUERY_CODEC,
+    QUERY_BITRATE,
+    QUERY_AUDIO,
+    QUERY_LATENCY,
+    QUERY_CONTAINER,
+    QUERY_FIELD_COUNT
+};
+
+static const char *const query_names[QUERY_FIELD_COUNT] = {
+    "backend", "codec", "bitrate", "audio", "latency", "container"
+};
+
+static int hex_value(unsigned char value) {
+    if (value >= '0' && value <= '9') return value - '0';
+    value = (unsigned char)tolower(value);
+    if (value >= 'a' && value <= 'f') return value - 'a' + 10;
+    return -1;
+}
+
+static int decode_component(const char *source, size_t source_length,
+                            char *destination, size_t destination_size) {
+    if (source_length == 0 || source_length >= destination_size) return 0;
+    size_t output = 0;
+    for (size_t input = 0; input < source_length; input++) {
+        unsigned char value = (unsigned char)source[input];
+        if (value == '%') {
+            if (input + 2 >= source_length) return 0;
+            int high = hex_value((unsigned char)source[input + 1]);
+            int low = hex_value((unsigned char)source[input + 2]);
+            if (high < 0 || low < 0) return 0;
+            value = (unsigned char)((high << 4) | low);
+            input += 2;
+        } else if (value == '+') {
+            value = ' ';
+        }
+        if (value == 0 || value < 0x20 || value == 0x7f) return 0;
+        destination[output++] = (char)value;
+    }
+    destination[output] = '\0';
+    return output > 0;
+}
+
+static int query_field(const char *name) {
+    for (int field = 0; field < QUERY_FIELD_COUNT; field++) {
+        if (strcmp(name, query_names[field]) == 0) return field;
+    }
+    return -1;
+}
+
+static int parse_bounded_int(const char *text, int minimum, int maximum,
+                             int *value) {
+    if (!text || !*text || !value) return 0;
+    errno = 0;
+    char *end = NULL;
+    long parsed = strtol(text, &end, 10);
+    if (errno != 0 || !end || *end != '\0' || parsed < minimum ||
+        parsed > maximum) return 0;
+    *value = (int)parsed;
+    return 1;
+}
+
+static int parse_query(const char *query,
+                       char values[QUERY_FIELD_COUNT][64],
+                       unsigned int *present,
+                       char *error, size_t error_size) {
+    *present = 0;
+    if (!query || !*query) return 1;
+
+    const char *parameter = query;
+    while (*parameter) {
+        const char *end = strchr(parameter, '&');
+        if (!end) end = parameter + strlen(parameter);
+        const char *equals = memchr(parameter, '=', (size_t)(end - parameter));
+        char name[32];
+        if (!equals || equals == parameter || equals + 1 == end ||
+            !decode_component(parameter, (size_t)(equals - parameter),
+                              name, sizeof(name))) {
+            snprintf(error, error_size, "Malformed or empty query parameter");
+            return 0;
+        }
+        int field = query_field(name);
+        if (field < 0) {
+            snprintf(error, error_size, "Unknown query parameter: %s", name);
+            return 0;
+        }
+        unsigned int bit = 1U << (unsigned int)field;
+        if (*present & bit) {
+            snprintf(error, error_size, "Duplicate query parameter: %s", name);
+            return 0;
+        }
+        if (!decode_component(equals + 1, (size_t)(end - equals - 1),
+                              values[field], sizeof(values[field]))) {
+            snprintf(error, error_size, "Invalid value for query parameter: %s", name);
+            return 0;
+        }
+        *present |= bit;
+        parameter = *end ? end + 1 : end;
+        if (!*parameter && *end == '&') {
+            snprintf(error, error_size, "Malformed or empty query parameter");
+            return 0;
+        }
+    }
+    return 1;
+}
+
+int stream_config_parse_request(const char *channel_path,
+                                const char *query,
+                                StreamConfig *config,
+                                char *error,
+                                size_t error_size) {
+    if (!config || !error || error_size == 0) return 0;
+    error[0] = '\0';
+    stream_config_init(config);
+
+    TranscodeContainer path_container = OUTPUT_INVALID;
+    if (channel_path &&
+        !stream_config_parse_channel_path(channel_path, config->channel_num,
+                                          sizeof(config->channel_num),
+                                          &path_container)) {
+        snprintf(error, error_size, "Invalid channel identifier");
+        return 0;
+    }
+
+    char values[QUERY_FIELD_COUNT][64] = {{0}};
+    unsigned int present = 0;
+    if (!parse_query(query, values, &present, error, error_size)) return 0;
+
+#define HAS(field) (present & (1U << (unsigned int)(field)))
+    config->backend = HAS(QUERY_BACKEND)
+        ? parse_backend(values[QUERY_BACKEND]) : BACKEND_SOFTWARE;
+    config->codec = HAS(QUERY_CODEC)
+        ? parse_codec(values[QUERY_CODEC]) : CODEC_COPY;
+    config->latency = HAS(QUERY_LATENCY)
+        ? parse_latency(values[QUERY_LATENCY]) : LATENCY_BALANCED;
+    TranscodeContainer query_container = HAS(QUERY_CONTAINER)
+        ? parse_container(values[QUERY_CONTAINER]) : OUTPUT_INVALID;
+    if (config->backend == BACKEND_INVALID || config->codec == CODEC_INVALID ||
+        config->latency == LATENCY_INVALID ||
+        (HAS(QUERY_CONTAINER) && query_container == OUTPUT_INVALID)) {
+        snprintf(error, error_size,
+                 "Invalid backend, codec, container, or latency profile");
+        return 0;
+    }
+
+    if (HAS(QUERY_BITRATE) &&
+        !parse_bounded_int(values[QUERY_BITRATE], 1, MAX_BITRATE_KBPS,
+                           &config->bitrate_kbps)) {
+        snprintf(error, error_size, "Invalid bitrate");
+        return 0;
+    }
+    if (HAS(QUERY_AUDIO)) {
+        const char *audio = values[QUERY_AUDIO];
+        if (strcmp(audio, "6") == 0 || strcmp(audio, "5.1") == 0 ||
+            strcmp(audio, "51") == 0) {
+            config->audio_channels = 6;
+        } else if (!parse_bounded_int(audio, 1, 8,
+                                      &config->audio_channels)) {
+            snprintf(error, error_size, "Invalid audio channel count");
+            return 0;
+        }
+    }
+
+    if (!stream_config_finalize(config, path_container, query_container)) {
+        snprintf(error, error_size, "Container conflicts with the URL or codec");
+        return 0;
+    }
+#undef HAS
     return 1;
 }
 
