@@ -17,6 +17,7 @@ ZapLink has been hardened for production environments:
 - **Weak-Signal Filtering**: Measures each scanned multiplex and comments out channels below 20 dB C/N unless explicitly retained.
 - **Robust EPG**: Background EPG collection with valid XMLTV output supporting Jellyfin Series Recording.
 - **Live Streaming**: Supports software and hardware transcoding (QSV, VAAPI, NVENC) via FFmpeg.
+- **Fast Stream Handoffs**: Compatible MPEG-TS requests share one normalized producer and remain warm briefly across probe-to-playback reconnects.
 - **Simple API**: HTTP endpoints for M3U playlists and XMLTV guide data.
 - **Journal Logging**: Plain key/value logs use syslog priority prefixes understood by journald and contain no terminal color sequences.
 
@@ -168,7 +169,13 @@ Base URL: `http://<host>:18392`
 
 - `GET /playlist.m3u`: M3U playlist for Jellyfin/VLC.
 - `GET /xmltv.xml`: XMLTV EPG data (Jellyfin compatible).
-- `GET /stream/<channel-id>`: Live stream (e.g., `/stream/15.1`).
+- `GET /stream/<channel-id>.ts`: MPEG-TS live stream (for example, `/stream/15.1.ts`).
+- `GET /stream/<channel-id>.mkv`: Matroska live stream when selected by the output profile.
+- `HEAD /stream/<channel-id>.<ext>`: Validate a stream URL and inspect its media type without acquiring a tuner.
+
+The generated playlist always uses a container-appropriate extension. Legacy
+extensionless URLs such as `/stream/15.1` remain supported and resolve to the
+same default MPEG-TS profile.
 
 Normally the channel ID is its virtual channel number. If multiple received
 stations advertise the same number, the playlist and XMLTV feed use a stable
@@ -184,6 +191,42 @@ All parameters are optional and can be appended to stream URLs or the playlist U
 | `codec` | `copy`, `h264`, `hevc`, `av1` | `copy` | Video codec (copy = passthrough) |
 | `bitrate` | Integer (kbps) | Auto | Target video bitrate (e.g., `6000`) |
 | `audio` | `2`, `6`, `5.1` | `2` | Audio channels (stereo or 5.1 surround) |
+| `container` | `mpegts`, `ts`, `matroska`, `mkv` | Auto | Output container; software AV1 requires Matroska |
+| `latency` | `low`, `balanced`, `robust` | `balanced` | Bounded probe, buffering, keyframe, and warm-session policy |
+
+The URL suffix and `container` parameter must agree. Invalid combinations are
+rejected with HTTP 400 rather than returning content under a misleading media
+type. Software AV1 retains its established Matroska output; other profiles use
+MPEG-TS unless explicitly configured otherwise.
+
+### Latency Profiles
+
+| Profile | Input analysis | Probe size | Forced transcode keyframes | Idle session lifetime | Use case |
+|---------|----------------|------------|----------------------------|-----------------------|----------|
+| `low` | 0.5 s | 1 MB | 1 s | 5 s | Interactive channel changes on clean local broadcasts |
+| `balanced` | 1 s | 5 MB | 2 s | 5 s | Default; good detection with short startup |
+| `robust` | 3 s | 20 MB | 3 s | 10 s | Sparse, damaged, or slow-to-identify transports |
+
+The low profile also enables FFmpeg's reduced-analysis buffering. All MPEG-TS
+profiles flush output packets promptly and repeat PAT/PMT tables. If a low
+profile loses audio or reports incomplete codec parameters, use `balanced` or
+`robust` rather than increasing arbitrary FFmpeg arguments.
+
+### Reusable Stream Sessions
+
+ZapLink normalizes the effective channel, container, codec, backend, bitrate,
+audio, and latency values into a stream-session key. Requests with the same
+effective settings share a single tuner and FFmpeg/remux producer even when
+their query parameters appear in a different order. Each client has an
+independent read cursor, so a slow or disconnected subscriber cannot block the
+producer indefinitely.
+
+After the last MPEG-TS subscriber disconnects, ZapLink continues draining the
+producer for the latency profile's short idle lifetime. A media probe followed
+by playback can therefore reuse the tuned stream instead of consuming another
+tuner and restarting FFmpeg. A different transcoding profile still requires a
+separate producer. Matroska is not joined in progress because new subscribers
+would not receive its required initial container header.
 
 ### Streaming Modes
 
@@ -207,27 +250,27 @@ When a codec is specified (`h264`, `hevc`, `av1`), FFmpeg processes the stream w
 
 1. **Passthrough (Default)** - zero CPU, original quality:
    ```sh
-   curl "http://localhost:18392/stream/15.1" > out.ts
+   curl "http://localhost:18392/stream/15.1.ts" > out.ts
    ```
 
 2. **Software Transcode to H.264** (stereo audio):
    ```sh
-   curl "http://localhost:18392/stream/15.1?codec=h264" > out.ts
+   curl "http://localhost:18392/stream/15.1.ts?codec=h264" > out.ts
    ```
 
 3. **Hardware Transcode (Intel QSV) to H.264 at 6Mbps**:
    ```sh
-   curl "http://localhost:18392/stream/15.1?backend=qsv&codec=h264&bitrate=6000" > out.ts
+   curl "http://localhost:18392/stream/15.1.ts?backend=qsv&codec=h264&bitrate=6000&latency=low" > out.ts
    ```
 
 4. **Hardware Transcode (VA-API) to HEVC with 5.1 audio**:
    ```sh
-   curl "http://localhost:18392/stream/15.1?backend=vaapi&codec=hevc&audio=6" > out.ts
+   curl "http://localhost:18392/stream/15.1.ts?backend=vaapi&codec=hevc&audio=6" > out.ts
    ```
 
 5. **NVIDIA NVENC to H.264**:
    ```sh
-   curl "http://localhost:18392/stream/15.1?backend=nvenc&codec=h264" > out.ts
+   curl "http://localhost:18392/stream/15.1.ts?backend=nvenc&codec=h264" > out.ts
    ```
 
 ## Jellyfin Setup
@@ -241,13 +284,17 @@ To use ZapLink with Jellyfin:
    - **File or URL**: `http://<ip>:18392/xmltv.xml`
 4. Save and click **Refresh Guide Data**.
 
+After upgrading from a version that generated extensionless stream URLs,
+refresh the tuner/guide data so clients receive the new `.ts` or `.mkv` URLs.
+Saved extensionless URLs continue working during the transition.
+
 To verify the live transport independently of Jellyfin, request a known active
 channel for a bounded interval:
 
 ```sh
 curl --max-time 8 --output /dev/null \
   --write-out 'HTTP %{http_code}, %{size_download} bytes\n' \
-  http://127.0.0.1:18392/stream/15.1
+  http://127.0.0.1:18392/stream/15.1.ts
 ```
 
 A live stream normally ends this test with curl timeout status 28; HTTP 200 and
@@ -255,10 +302,24 @@ a nonzero byte count confirm that transport data was received. If zero bytes
 are returned, inspect `journalctl -u zaplink` for tuner discovery, no-tuner, or
 stream-stall messages.
 
+Check a profile without opening a tuner:
+
+```sh
+curl --head 'http://127.0.0.1:18392/stream/15.1.ts?latency=low'
+```
+
+The response should report `Content-Type: video/mp2t` and
+`X-Zaplink-Latency: low`. Session lifecycle logs use component `SESSION` and
+distinguish a newly created producer from a reused one. If identical requests
+create separate producers, confirm that every media-affecting option is equal;
+different bitrate, audio, codec, backend, container, or latency values are
+intentionally isolated.
+
 ## Verification
 
 Run the build and regression tests for channel identity, tuner lease preemption,
-and concurrent EPG database writers with:
+concurrent EPG database writers, stream URL/profile normalization, shared
+delivery, linger cleanup, and producer-start failure recovery with:
 
 ```sh
 make test

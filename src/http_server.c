@@ -50,6 +50,9 @@ static int shutdown_token;
 void send_response(int sockfd, const char *status, const char *type,
                    const char *body);
 
+static void send_response_ex(int sockfd, const char *status, const char *type,
+                             const char *body, int head_only);
+
 static time_t monotonic_seconds(void) {
     struct timespec now;
     if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0;
@@ -176,14 +179,19 @@ static int write_all(int fd, const char *buf, size_t len) {
     return 1;
 }
 
-void send_response(int sockfd, const char *status, const char *type, const char *body) {
+static void send_response_ex(int sockfd, const char *status, const char *type,
+                             const char *body, int head_only) {
     char header[512];
     int len = body ? (int)strlen(body) : 0;
     snprintf(header, sizeof(header), 
         "HTTP/1.1 %s\r\nContent-Type: %s\r\nContent-Length: %d\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n", 
         status, type, len);
     write_all(sockfd, header, strlen(header));
-    if (body) write_all(sockfd, body, len);
+    if (body && !head_only) write_all(sockfd, body, len);
+}
+
+void send_response(int sockfd, const char *status, const char *type, const char *body) {
+    send_response_ex(sockfd, status, type, body, 0);
 }
 
 // ... URL utilities ...
@@ -242,23 +250,94 @@ static int parse_bounded_int(const char *text, int minimum, int maximum,
     return 1;
 }
 
+static int parse_stream_config(const char *channel_path, const char *query,
+                               StreamConfig *config, char *error,
+                               size_t error_size) {
+    stream_config_init(config);
+    TranscodeContainer path_container = OUTPUT_INVALID;
+    if (channel_path &&
+        !stream_config_parse_channel_path(channel_path, config->channel_num,
+                                          sizeof(config->channel_num),
+                                          &path_container)) {
+        snprintf(error, error_size, "Invalid channel identifier");
+        return 0;
+    }
+
+    char backend[64] = {0}, codec[64] = {0}, bitrate[64] = {0};
+    char audio[64] = {0}, latency[64] = {0}, container[64] = {0};
+    int has_backend = get_query_param(query, "backend", backend, sizeof(backend));
+    int has_codec = get_query_param(query, "codec", codec, sizeof(codec));
+    int has_bitrate = get_query_param(query, "bitrate", bitrate, sizeof(bitrate));
+    int has_audio = get_query_param(query, "audio", audio, sizeof(audio));
+    int has_latency = get_query_param(query, "latency", latency, sizeof(latency));
+    int has_container = get_query_param(query, "container", container, sizeof(container));
+    if (has_backend < 0 || has_codec < 0 || has_bitrate < 0 || has_audio < 0 ||
+        has_latency < 0 || has_container < 0) {
+        snprintf(error, error_size, "Query parameter is too long");
+        return 0;
+    }
+
+    config->backend = has_backend ? parse_backend(backend) : BACKEND_SOFTWARE;
+    config->codec = has_codec ? parse_codec(codec) : CODEC_COPY;
+    config->latency = has_latency ? parse_latency(latency) : LATENCY_BALANCED;
+    TranscodeContainer query_container = has_container
+        ? parse_container(container) : OUTPUT_INVALID;
+    if (config->backend == BACKEND_INVALID || config->codec == CODEC_INVALID ||
+        config->latency == LATENCY_INVALID ||
+        (has_container && query_container == OUTPUT_INVALID)) {
+        snprintf(error, error_size, "Invalid backend, codec, container, or latency profile");
+        return 0;
+    }
+
+    if (has_bitrate && !parse_bounded_int(bitrate, 1, MAX_BITRATE_KBPS,
+                                           &config->bitrate_kbps)) {
+        snprintf(error, error_size, "Invalid bitrate");
+        return 0;
+    }
+    if (has_audio) {
+        if (strcmp(audio, "6") == 0 || strcmp(audio, "5.1") == 0 ||
+            strcmp(audio, "51") == 0) {
+            config->audio_channels = 6;
+        } else if (!parse_bounded_int(audio, 1, 8, &config->audio_channels)) {
+            snprintf(error, error_size, "Invalid audio channel count");
+            return 0;
+        }
+    }
+
+    if (!stream_config_finalize(config, path_container, query_container)) {
+        snprintf(error, error_size, "Container conflicts with the URL or codec");
+        return 0;
+    }
+    return 1;
+}
+
 // M3U Cache
 static char *g_m3u_cache = NULL;
 static char g_m3u_cache_host[256] = {0};
 static pthread_mutex_t g_m3u_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-void handle_m3u(int sockfd, const char *host, const char *query) {
+void handle_m3u(int sockfd, const char *host, const char *query, int head_only) {
     // If query params exist, ignore cache and generate dynamic
     // Otherwise serve from cache if host matches
     
     if ((!query || query[0] == '\0') && host && host[0]) {
         pthread_mutex_lock(&g_m3u_mutex);
         if (g_m3u_cache && strcmp(g_m3u_cache_host, host) == 0) {
-            send_response(sockfd, "200 OK", "audio/x-mpegurl", g_m3u_cache);
+            send_response_ex(sockfd, "200 OK", "audio/x-mpegurl", g_m3u_cache,
+                             head_only);
             pthread_mutex_unlock(&g_m3u_mutex);
             return;
         }
         pthread_mutex_unlock(&g_m3u_mutex);
+    }
+
+    StreamConfig playlist_config;
+    char parse_error[160];
+    if (!parse_stream_config(NULL, query, &playlist_config, parse_error,
+                             sizeof(parse_error))) {
+        send_response_ex(sockfd, "400 Bad Request", "text/plain", parse_error,
+                         head_only);
+        return;
     }
 
     size_t cap = 64 * 1024, size = 0;
@@ -275,13 +354,15 @@ void handle_m3u(int sockfd, const char *host, const char *query) {
         char channel_id[128];
         get_unique_channel_id(&channels[i], channel_id, sizeof(channel_id));
         if (query && query[0] != '\0') {
-            snprintf(entry, sizeof(entry), "#EXTINF:-1 tvg-id=\"%.127s\" tvg-name=\"%.63s\",%.31s %.63s\nhttp://%.255s/stream/%.127s?%.1023s\n",
+            snprintf(entry, sizeof(entry), "#EXTINF:-1 tvg-id=\"%.127s\" tvg-name=\"%.63s\",%.31s %.63s\nhttp://%.255s/stream/%.127s%s?%.1023s\n",
                      channel_id, channels[i].name, channels[i].number,
-                     channels[i].name, host, channel_id, query);
+                     channels[i].name, host, channel_id,
+                     stream_config_extension(&playlist_config), query);
         } else {
-            snprintf(entry, sizeof(entry), "#EXTINF:-1 tvg-id=\"%.127s\" tvg-name=\"%.63s\",%.31s %.63s\nhttp://%.255s/stream/%.127s\n",
+            snprintf(entry, sizeof(entry), "#EXTINF:-1 tvg-id=\"%.127s\" tvg-name=\"%.63s\",%.31s %.63s\nhttp://%.255s/stream/%.127s%s\n",
                      channel_id, channels[i].name, channels[i].number,
-                     channels[i].name, host, channel_id);
+                     channels[i].name, host, channel_id,
+                     stream_config_extension(&playlist_config));
         }
         
         size_t entry_len = strlen(entry);
@@ -299,7 +380,7 @@ void handle_m3u(int sockfd, const char *host, const char *query) {
         size += entry_len;
     }
     
-    send_response(sockfd, "200 OK", "audio/x-mpegurl", m3u);
+    send_response_ex(sockfd, "200 OK", "audio/x-mpegurl", m3u, head_only);
 
     // Update cache if this was a clean request (no query)
     if ((!query || query[0] == '\0') && host && host[0]) {
@@ -338,9 +419,10 @@ void process_client_request(void *arg) {
         finish_client(ctx);
         return;
     }
-    if (strcmp(method, "GET") != 0) {
+    int head_only = strcmp(method, "HEAD") == 0;
+    if (strcmp(method, "GET") != 0 && !head_only) {
         send_response(sockfd, "405 Method Not Allowed", "text/plain",
-                      "Only GET is supported");
+                      "Only GET and HEAD are supported");
         finish_client(ctx);
         return;
     }
@@ -371,82 +453,57 @@ void process_client_request(void *arg) {
     }
 
     if (strcmp(path, "/playlist.m3u") == 0) {
-        handle_m3u(sockfd, host, query);
+        handle_m3u(sockfd, host, query, head_only);
     } else if (strcmp(path, "/xmltv.xml") == 0) {
         if (g_no_epg) {
-            send_response(sockfd, "404 Not Found", "text/plain", "EPG support is disabled via command line (-n)");
+                send_response_ex(sockfd, "404 Not Found", "text/plain",
+                                 "EPG support is disabled via command line (-n)",
+                                 head_only);
         } else {
             char *xml = db_get_xmltv_programs();
             if (xml) { 
-                send_response(sockfd, "200 OK", "application/xml", xml); 
+                send_response_ex(sockfd, "200 OK", "application/xml", xml,
+                                 head_only);
                 free(xml); 
             } else {
-                send_response(sockfd, "500 Internal Server Error", "text/plain", "Failed to generate EPG");
+                send_response_ex(sockfd, "500 Internal Server Error", "text/plain",
+                                 "Failed to generate EPG", head_only);
             }
         }
     } else if (strncmp(path, "/stream/", 8) == 0) {
-        StreamConfig config = {0};
-        size_t channel_id_length = strlen(path + 8);
-        if (channel_id_length >= sizeof(config.channel_num)) {
-            send_response(sockfd, "414 URI Too Long", "text/plain",
-                          "Channel identifier is too long");
+        StreamConfig config;
+        char parse_error[160];
+        if (!parse_stream_config(path + 8, query, &config, parse_error,
+                                 sizeof(parse_error))) {
+            send_response_ex(sockfd, "400 Bad Request", "text/plain", parse_error,
+                             head_only);
             finish_client(ctx);
             return;
         }
-        memcpy(config.channel_num, path + 8, channel_id_length + 1);
-        
-        char b_param[64] = {0}, c_param[64] = {0}, br_param[64] = {0}, a_param[64] = {0};
-        int has_b = get_query_param(query, "backend", b_param, sizeof(b_param));
-        int has_c = get_query_param(query, "codec", c_param, sizeof(c_param));
-        int has_br = get_query_param(query, "bitrate", br_param, sizeof(br_param));
-        int has_a = get_query_param(query, "audio", a_param, sizeof(a_param));
-
-        if (has_b < 0 || has_c < 0 || has_br < 0 || has_a < 0) {
-            send_response(sockfd, "400 Bad Request", "text/plain",
-                          "Query parameter is too long");
+        if (!find_channel_by_id(config.channel_num)) {
+            send_response_ex(sockfd, "404 Not Found", "text/plain",
+                             "Channel not found or identifier is ambiguous",
+                             head_only);
             finish_client(ctx);
             return;
         }
 
-        config.backend = has_b ? parse_backend(b_param) : BACKEND_SOFTWARE;
-        config.codec = has_c ? parse_codec(c_param) : CODEC_COPY;
-        if (config.backend == BACKEND_INVALID || config.codec == CODEC_INVALID) {
-            send_response(sockfd, "400 Bad Request", "text/plain",
-                          "Invalid backend or codec");
-            finish_client(ctx);
-            return;
-        }
-        if (has_br && !parse_bounded_int(br_param, 1, MAX_BITRATE_KBPS,
-                                         &config.bitrate_kbps)) {
-            send_response(sockfd, "400 Bad Request", "text/plain",
-                          "Invalid bitrate");
-            finish_client(ctx);
-            return;
-        }
+        LOG_INFO("HTTP",
+                 "%s stream request: channel=%s codec=%d backend=%d container=%s latency=%s bitrate=%d audio=%dch",
+                 head_only ? "HEAD" : "GET", config.channel_num, config.codec,
+                 config.backend, stream_config_extension(&config),
+                 stream_latency_name(config.latency), config.bitrate_kbps,
+                 config.audio_channels);
 
-        if (has_a) {
-            if (strcmp(a_param, "6") == 0 || strcmp(a_param, "5.1") == 0 || strcmp(a_param, "51") == 0) {
-                config.audio_channels = 6;
-            } else if (!parse_bounded_int(a_param, 1, 8,
-                                          &config.audio_channels)) {
-                send_response(sockfd, "400 Bad Request", "text/plain",
-                              "Invalid audio channel count");
-                finish_client(ctx);
-                return;
-            }
-        } else {
-            config.audio_channels = 2;
-        }
-
-        LOG_INFO("HTTP", "Stream request: %s (backend=%s, codec=%s, bitrate=%s, audio=%dch)", 
-                 config.channel_num, has_b ? b_param : "none", has_c ? c_param : "copy", 
-                 config.bitrate_kbps > 0 ? br_param : "auto", config.audio_channels);
-
-        int is_software_av1 = (config.codec == CODEC_AV1 && config.backend == BACKEND_SOFTWARE);
-        char head[256];
-        const char *mime = is_software_av1 ? "video/x-matroska" : "video/mp2t";
-        snprintf(head, sizeof(head), "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n", mime);
-        handle_unified_stream(sockfd, &config, head);
+        char head[384];
+        snprintf(head, sizeof(head),
+                 "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nCache-Control: no-store\r\n"
+                 "X-Zaplink-Latency: %s\r\nConnection: close\r\n"
+                 "Access-Control-Allow-Origin: *\r\n\r\n",
+                 stream_config_mime_type(&config),
+                 stream_latency_name(config.latency));
+        if (head_only) write_all(sockfd, head, strlen(head));
+        else handle_unified_stream(sockfd, &config, head);
     } else {
         send_response(sockfd, "404 Not Found", "text/plain", "ZapLink Engine: Valid endpoints: /stream/{ch}, /playlist.m3u, /xmltv.xml");
     }
@@ -656,6 +713,7 @@ void start_http_server(int port) {
 cleanup:
     while (pending_clients) close_pending_client(pending_clients);
     stop_active_streams();
+    shutdown_stream_sessions();
     thread_pool_destroy(pool);
     close(epoll_fd);
     close(server_fd);

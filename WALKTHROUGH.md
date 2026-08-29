@@ -16,6 +16,22 @@ The pipeline `dvbv5-zap | ffmpeg` is now constructed using direct system calls:
 -   **`fork()` & `pipe()`**: Processes are spawned individually with manual pipe management.
 -   **`execvp()` / `execlp()`**: Binaries are executed directly, bypassing the shell.
 -   **Transport Output**: `dvbv5-zap` runs with `-p -o -`. Lowercase `-p` selects the requested service PIDs, adds PAT/PMT, implies record mode, and writes MPEG-TS to the pipeline. Uppercase `-P` must not be used here because it emits every program on the multiplex and allows FFmpeg to select the first subchannel.
+-   **Low-Latency Output**: MPEG-TS output repeats PAT/PMT, marks the initial discontinuity, flushes packets promptly, and uses time-based forced keyframes for transcoded video.
+
+### Stream Contracts and Profiles (`src/stream_config.c`)
+
+-   Generated URLs carry `.ts` or `.mkv` according to the actual muxer and MIME type. Existing extensionless URLs remain valid.
+-   `HEAD` validates the channel and normalized profile but never acquires a tuner.
+-   `low`, `balanced`, and `robust` profiles select bounded analysis duration, probe size, transcode keyframe interval, input buffering, and idle-session lifetime.
+-   Explicit URL suffixes and `container` parameters must agree. Software AV1 remains Matroska and invalid combinations fail before process creation.
+
+### Reusable Delivery (`src/stream_session.c`)
+
+-   A session key compares normalized channel, backend, codec, container, latency, bitrate, and audio values rather than raw query-string order.
+-   Identical MPEG-TS subscribers receive one producer through a bounded 4 MB broadcast ring. A subscriber that falls behind the retained window is disconnected instead of blocking every viewer.
+-   The producer remains alive for a short profile-dependent grace period after its final subscriber leaves. Probe-to-playback reconnects attach to that producer without retuning.
+-   Producer startup failure wakes every waiter, releases the session slot, and permits a later request to recover. Shutdown stops producers and waits for tuner/process cleanup.
+-   Matroska sessions are intentionally not joined in progress because their initial container header cannot be reconstructed safely for a late subscriber.
 
 ### Argument Safety Strategy
 To prevent command truncation or buffer overflows, a "sticky error" pattern is used for building the argument list:
@@ -27,7 +43,8 @@ To prevent command truncation or buffer overflows, a "sticky error" pattern is u
 -   **Buffered Reading**: Handles fragmented TCP packets robustly.
 -   **Size Limit**: Enforces a 4KB maximum for HTTP headers.
 -   **Header Deadline**: Incomplete requests expire after 10 seconds and pending header connections are capped.
--   **Input Validation**: Methods, exact query names, codecs, backends, bitrates, and audio channel counts are validated before dispatch.
+-   **Input Validation**: Methods, exact query names, codecs, containers, latency profiles, backends, bitrates, and audio channel counts are validated before dispatch.
+-   **Side-Effect-Free HEAD**: Stream metadata can be inspected without creating a pipeline or reserving DVB hardware.
 -   **Deferred Response**: Waits for valid stream data before sending `200 OK`.
 -   **Bounded Pipelines**: Stream startup and later no-data stalls terminate after 15 seconds with bounded process-group cleanup.
 
@@ -73,6 +90,6 @@ To prevent command truncation or buffer overflows, a "sticky error" pattern is u
 -   **Process Tree**: Confirmed no `sh` processes in the hierarchy.
 -   **Startup Readiness**: Verified immediate discovery with two frontends and the bounded 30-second no-device timeout path.
 -   **Signal Filtering**: Verified both default exclusion and explicit retention against a 49-channel configuration; the filtered file loaded only active, uncommented services.
--   **Regression Tests**: `make test` verifies duplicate IDs, stale tuner lease rejection, and simultaneous EPG database writers.
+-   **Regression Tests**: `make test` verifies duplicate IDs, stale tuner lease rejection, simultaneous EPG database writers, typed and compatibility URLs, profile normalization, multi-subscriber reuse, linger cleanup, and producer failure recovery.
 -   **Noninteractive Scanner**: Closed stdin exits with status 1 and a structured error without modifying `channels.conf`.
 -   **Graceful Streaming Shutdown**: An active transport stream terminates and releases its tuner within one second of SIGTERM in the hardware integration check.

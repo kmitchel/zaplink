@@ -1,56 +1,56 @@
 #define _GNU_SOURCE
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-#include <signal.h>
-#include <sys/wait.h>
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <poll.h>
+#include <glob.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <time.h>
-#include <glob.h>
-#include "transcode.h"
-#include "log.h"
-#include "config.h"
-#include "tuner.h"
+#include <unistd.h>
+
 #include "channels.h"
+#include "config.h"
+#include "log.h"
+#include "stream_session.h"
+#include "transcode.h"
+#include "tuner.h"
 
-TranscodeBackend parse_backend(const char *name) {
-    if (!name) return BACKEND_SOFTWARE;
-    if (strcasecmp(name, "qsv") == 0) return BACKEND_QSV;
-    if (strcasecmp(name, "nvenc") == 0) return BACKEND_NVENC;
-    if (strcasecmp(name, "vaapi") == 0) return BACKEND_VAAPI;
-    if (strcasecmp(name, "software") == 0) return BACKEND_SOFTWARE;
-    return BACKEND_INVALID;
+typedef struct {
+    pid_t process_group;
+    Tuner *tuner;
+    unsigned long lease_generation;
+} PipelineContext;
+
+static pthread_once_t session_init_once = PTHREAD_ONCE_INIT;
+static int sessions_ready;
+
+static int validate_channel_id(const char *value) {
+    if (!value || !*value) return 0;
+    for (const char *cursor = value; *cursor; cursor++) {
+        if (!isdigit((unsigned char)*cursor) && *cursor != '.' && *cursor != '-') return 0;
+    }
+    return 1;
 }
 
-TranscodeCodec parse_codec(const char *name) {
-    if (!name) return CODEC_H264;
-    if (strcasecmp(name, "h264") == 0) return CODEC_H264;
-    if (strcasecmp(name, "hevc") == 0 || strcasecmp(name, "h265") == 0) return CODEC_HEVC;
-    if (strcasecmp(name, "av1") == 0) return CODEC_AV1;
-    if (strcasecmp(name, "copy") == 0) return CODEC_COPY;
-    return CODEC_INVALID;
-}
-
-static int write_all(int fd, const char *buf, size_t len);
-
-/**
- * Validate channel number format to prevent shell injection.
- * Only allows digits, dots, and hyphens (e.g., "15.1", "21-1", "33.2").
- * Returns 1 if valid, 0 if invalid.
- */
-static int validate_channel_id(const char *s) {
-    if (!s || !*s) return 0;
-    for (const char *p = s; *p; p++) {
-        if (!isdigit((unsigned char)*p) && *p != '.' && *p != '-') {
+static int write_all(int fd, const void *data, size_t length) {
+    const unsigned char *cursor = data;
+    while (length > 0) {
+        ssize_t written = write(fd, cursor, length);
+        if (written < 0) {
+            if (errno == EINTR) continue;
             return 0;
         }
+        cursor += written;
+        length -= (size_t)written;
     }
     return 1;
 }
@@ -61,538 +61,436 @@ static void send_stream_error(int fd, const char *status, const char *message) {
     int header_length = snprintf(
         header, sizeof(header),
         "HTTP/1.1 %s\r\nContent-Type: text/plain\r\nContent-Length: %zu\r\n"
-        "Connection: close\r\n\r\n",
-        status, length);
+        "Connection: close\r\n\r\n", status, length);
     if (header_length > 0 && (size_t)header_length < sizeof(header)) {
         write_all(fd, header, (size_t)header_length);
         write_all(fd, message, length);
     }
 }
 
-static time_t monotonic_seconds(void) {
+static int64_t monotonic_milliseconds(void) {
     struct timespec now;
     if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0;
-    return now.tv_sec;
+    return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
 }
 
-static void terminate_process_group(pid_t pid, int *reaped) {
+static void terminate_process_group(pid_t pid) {
     if (pid <= 0) return;
     kill(-pid, SIGTERM);
     int status;
-    for (int i = 0; i < 20; i++) {
+    for (int attempt = 0; attempt < 20; attempt++) {
         pid_t result = waitpid(pid, &status, WNOHANG);
-        if (result == pid || (result < 0 && errno == ECHILD)) {
-            if (reaped) *reaped = 1;
-            return;
-        }
+        if (result == pid || (result < 0 && errno == ECHILD)) return;
         usleep(50000);
     }
     kill(-pid, SIGKILL);
-    if (waitpid(pid, &status, 0) == pid && reaped) *reaped = 1;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
 }
 
-/**
- * Write all bytes to socket, handling partial writes and EINTR.
- * With SO_SNDTIMEO set on the socket, write() will timeout after the configured duration.
- * Returns 1 on success, 0 on error/timeout (client disconnected or slow).
- */
-static int write_all(int fd, const char *buf, size_t len) {
-    size_t written = 0;
-    while (written < len) {
-        ssize_t n = write(fd, buf + written, len - written);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            return 0; // Error, timeout, or disconnect
-        }
-        written += n;
-    }
-    return 1;
-}
-
-// Helper to append args to argv with sticky error handling
-static void add_arg(char **argv, int *argc, const char *arg, int *err) {
-    if (*err) return; // Propagate error (sticky)
-
-    if (*argc < 127) {
-        argv[*argc] = (char *)arg;
-        argv[*argc + 1] = NULL;
-        (*argc)++;
+static void add_arg(char **arguments, int *count, const char *argument, int *error) {
+    if (*error) return;
+    if (*count >= 127) {
+        *error = 1;
         return;
     }
-    
-    // Overflow detected
-    LOG_ERROR("TRANSCODE", "Argv limit exceeded (128), dropping argument: %s", arg);
-    *err = 1;
+    arguments[(*count)++] = (char *)argument;
+    arguments[*count] = NULL;
 }
 
-/* Find the first usable VA-API render node dynamically */
 static const char *find_vaapi_device(void) {
     static char device[64];
     glob_t matches;
-    if (glob("/dev/dri/renderD*", GLOB_NOSORT, NULL, &matches) != 0)
+    if (glob("/dev/dri/renderD*", GLOB_NOSORT, NULL, &matches) != 0) {
         return "/dev/dri/renderD128";
-    if (matches.gl_pathc > 0)
-        snprintf(device, sizeof(device), "%s", matches.gl_pathv[0]);
-    else
-        snprintf(device, sizeof(device), "/dev/dri/renderD128");
+    }
+    if (matches.gl_pathc > 0) snprintf(device, sizeof(device), "%s", matches.gl_pathv[0]);
+    else snprintf(device, sizeof(device), "/dev/dri/renderD128");
     globfree(&matches);
     return device;
 }
 
-void handle_unified_stream(int sockfd, StreamConfig *config, const char *http_header) {
-    // SECURITY: Validate channel_num to prevent shell injection
-    if (!validate_channel_id(config->channel_num)) {
-        LOG_WARN("TRANSCODE", "Invalid channel number format: %s", config->channel_num);
-        send_stream_error(sockfd, "400 Bad Request", "Invalid channel identifier");
-        return;
+static void build_ffmpeg_arguments(const StreamConfig *config,
+                                   char **arguments,
+                                   int *argument_error) {
+    int count = 0;
+    static _Thread_local char analyze[24];
+    static _Thread_local char probe[24];
+    static _Thread_local char audio_channels[8];
+    static _Thread_local char bitrate[24];
+    static _Thread_local char maxrate[24];
+    static _Thread_local char bufsize[24];
+    static _Thread_local char keyframe[80];
+
+    snprintf(analyze, sizeof(analyze), "%d", config->analyze_duration_us);
+    snprintf(probe, sizeof(probe), "%d", config->probe_size_bytes);
+    snprintf(audio_channels, sizeof(audio_channels), "%d", config->audio_channels);
+    snprintf(keyframe, sizeof(keyframe), "expr:gte(t,n_forced*%.3f)",
+             config->keyframe_interval_ms / 1000.0);
+
+    add_arg(arguments, &count, "ffmpeg", argument_error);
+    add_arg(arguments, &count, "-hide_banner", argument_error);
+    add_arg(arguments, &count, "-loglevel", argument_error);
+    add_arg(arguments, &count, g_verbose ? "info" : "error", argument_error);
+    add_arg(arguments, &count, "-fflags", argument_error);
+    add_arg(arguments, &count,
+            config->no_buffer ? "+genpts+discardcorrupt+nobuffer"
+                              : "+genpts+discardcorrupt",
+            argument_error);
+    add_arg(arguments, &count, "-analyzeduration", argument_error);
+    add_arg(arguments, &count, analyze, argument_error);
+    add_arg(arguments, &count, "-probesize", argument_error);
+    add_arg(arguments, &count, probe, argument_error);
+    add_arg(arguments, &count, "-thread_queue_size", argument_error);
+    add_arg(arguments, &count, "512", argument_error);
+    add_arg(arguments, &count, "-f", argument_error);
+    add_arg(arguments, &count, "mpegts", argument_error);
+    add_arg(arguments, &count, "-i", argument_error);
+    add_arg(arguments, &count, "-", argument_error);
+
+    if (config->codec == CODEC_COPY) {
+        add_arg(arguments, &count, "-c", argument_error);
+        add_arg(arguments, &count, "copy", argument_error);
+    } else {
+        switch (config->backend) {
+            case BACKEND_QSV:
+                add_arg(arguments, &count, "-hwaccel", argument_error);
+                add_arg(arguments, &count, "qsv", argument_error);
+                add_arg(arguments, &count, "-hwaccel_output_format", argument_error);
+                add_arg(arguments, &count, "qsv", argument_error);
+                add_arg(arguments, &count, "-init_hw_device", argument_error);
+                add_arg(arguments, &count, "qsv=qsv:hw", argument_error);
+                add_arg(arguments, &count, "-filter_hw_device", argument_error);
+                add_arg(arguments, &count, "qsv", argument_error);
+                break;
+            case BACKEND_NVENC:
+                add_arg(arguments, &count, "-hwaccel", argument_error);
+                add_arg(arguments, &count, "cuda", argument_error);
+                add_arg(arguments, &count, "-hwaccel_output_format", argument_error);
+                add_arg(arguments, &count, "cuda", argument_error);
+                break;
+            case BACKEND_VAAPI:
+                add_arg(arguments, &count, "-hwaccel", argument_error);
+                add_arg(arguments, &count, "vaapi", argument_error);
+                add_arg(arguments, &count, "-hwaccel_output_format", argument_error);
+                add_arg(arguments, &count, "vaapi", argument_error);
+                add_arg(arguments, &count, "-hwaccel_device", argument_error);
+                add_arg(arguments, &count, find_vaapi_device(), argument_error);
+                break;
+            default:
+                break;
+        }
+
+        add_arg(arguments, &count, "-vf", argument_error);
+        switch (config->backend) {
+            case BACKEND_QSV:
+                add_arg(arguments, &count, "vpp_qsv=deinterlace=2", argument_error);
+                break;
+            case BACKEND_NVENC:
+                add_arg(arguments, &count, "yadif_cuda=0:-1:1", argument_error);
+                break;
+            case BACKEND_VAAPI:
+                add_arg(arguments, &count, "deinterlace_vaapi", argument_error);
+                break;
+            default:
+                add_arg(arguments, &count, "yadif=0:-1:1,format=yuv420p", argument_error);
+                break;
+        }
+
+        add_arg(arguments, &count, "-c:v", argument_error);
+        if (config->backend == BACKEND_QSV) {
+            add_arg(arguments, &count,
+                    config->codec == CODEC_H264 ? "h264_qsv" :
+                    config->codec == CODEC_HEVC ? "hevc_qsv" : "av1_qsv",
+                    argument_error);
+            if (config->codec != CODEC_AV1) {
+                add_arg(arguments, &count, "-look_ahead", argument_error);
+                add_arg(arguments, &count, "0", argument_error);
+            }
+            add_arg(arguments, &count, "-async_depth", argument_error);
+            add_arg(arguments, &count, "1", argument_error);
+        } else if (config->backend == BACKEND_NVENC) {
+            add_arg(arguments, &count,
+                    config->codec == CODEC_H264 ? "h264_nvenc" :
+                    config->codec == CODEC_HEVC ? "hevc_nvenc" : "av1_nvenc",
+                    argument_error);
+            add_arg(arguments, &count, "-preset", argument_error);
+            add_arg(arguments, &count, "p1", argument_error);
+            add_arg(arguments, &count, "-tune", argument_error);
+            add_arg(arguments, &count, "ll", argument_error);
+            if (config->codec != CODEC_AV1) {
+                add_arg(arguments, &count, "-zerolatency", argument_error);
+                add_arg(arguments, &count, "1", argument_error);
+            }
+        } else if (config->backend == BACKEND_VAAPI) {
+            add_arg(arguments, &count,
+                    config->codec == CODEC_H264 ? "h264_vaapi" :
+                    config->codec == CODEC_HEVC ? "hevc_vaapi" : "av1_vaapi",
+                    argument_error);
+            if (config->codec != CODEC_AV1) {
+                add_arg(arguments, &count, "-compression_level", argument_error);
+                add_arg(arguments, &count, "0", argument_error);
+            }
+        } else if (config->codec == CODEC_HEVC) {
+            add_arg(arguments, &count, "libx265", argument_error);
+            add_arg(arguments, &count, "-preset", argument_error);
+            add_arg(arguments, &count, "ultrafast", argument_error);
+        } else if (config->codec == CODEC_AV1) {
+            add_arg(arguments, &count, "libsvtav1", argument_error);
+            add_arg(arguments, &count, "-preset", argument_error);
+            add_arg(arguments, &count, "12", argument_error);
+        } else {
+            add_arg(arguments, &count, "libx264", argument_error);
+            add_arg(arguments, &count, "-preset", argument_error);
+            add_arg(arguments, &count, "ultrafast", argument_error);
+            add_arg(arguments, &count, "-tune", argument_error);
+            add_arg(arguments, &count, "zerolatency", argument_error);
+        }
+
+        if (config->bitrate_kbps > 0) {
+            snprintf(bitrate, sizeof(bitrate), "%dk", config->bitrate_kbps);
+            snprintf(maxrate, sizeof(maxrate), "%dk", config->bitrate_kbps * 2);
+            snprintf(bufsize, sizeof(bufsize), "%dk", config->bitrate_kbps * 4);
+            add_arg(arguments, &count, "-b:v", argument_error);
+            add_arg(arguments, &count, bitrate, argument_error);
+            if (config->backend != BACKEND_SOFTWARE || config->codec != CODEC_AV1) {
+                add_arg(arguments, &count, "-maxrate", argument_error);
+                add_arg(arguments, &count, maxrate, argument_error);
+                add_arg(arguments, &count, "-bufsize", argument_error);
+                add_arg(arguments, &count, bufsize, argument_error);
+            }
+        }
+
+        add_arg(arguments, &count, "-force_key_frames", argument_error);
+        add_arg(arguments, &count, keyframe, argument_error);
+        add_arg(arguments, &count, "-c:a", argument_error);
+        add_arg(arguments, &count, "aac", argument_error);
+        add_arg(arguments, &count, "-ac", argument_error);
+        add_arg(arguments, &count, audio_channels, argument_error);
     }
 
-    Channel *c = find_channel_by_id(config->channel_num);
-    if (!c) {
-        LOG_WARN("TRANSCODE", "Channel not found: %s", config->channel_num);
-        send_stream_error(sockfd, "404 Not Found", "Channel not found or identifier is ambiguous");
-        return;
+    add_arg(arguments, &count, "-f", argument_error);
+    if (config->container == OUTPUT_MATROSKA) {
+        add_arg(arguments, &count, "matroska", argument_error);
+    } else {
+        add_arg(arguments, &count, "mpegts", argument_error);
+        add_arg(arguments, &count, "-mpegts_flags", argument_error);
+        add_arg(arguments, &count, "+resend_headers+initial_discontinuity", argument_error);
+        add_arg(arguments, &count, "-pat_period", argument_error);
+        add_arg(arguments, &count, "0.1", argument_error);
+        add_arg(arguments, &count, "-sdt_period", argument_error);
+        add_arg(arguments, &count, "0.5", argument_error);
+        add_arg(arguments, &count, "-flush_packets", argument_error);
+        add_arg(arguments, &count, "1", argument_error);
     }
+    add_arg(arguments, &count, "-", argument_error);
+}
+
+static int start_pipeline(const StreamConfig *config, StreamProducer *producer) {
+    if (!validate_channel_id(config->channel_num)) return -1;
+    Channel *channel = find_channel_by_id(config->channel_num);
+    if (!channel) return -1;
 
     unsigned long lease_generation = 0;
-    Tuner *t = acquire_tuner(USER_STREAM, &lease_generation);
-    if (!t) {
-        LOG_WARN("TRANSCODE", "No tuner available for stream");
-        send_stream_error(sockfd, "503 Service Unavailable", "No tuner available");
-        return;
+    Tuner *tuner = acquire_tuner(USER_STREAM, &lease_generation);
+    if (!tuner) return -1;
+
+    int zap_pipe[2] = {-1, -1};
+    int output_pipe[2] = {-1, -1};
+    if (pipe(zap_pipe) < 0 || pipe(output_pipe) < 0) {
+        if (zap_pipe[0] >= 0) close(zap_pipe[0]);
+        if (zap_pipe[1] >= 0) close(zap_pipe[1]);
+        if (output_pipe[0] >= 0) close(output_pipe[0]);
+        if (output_pipe[1] >= 0) close(output_pipe[1]);
+        release_tuner(tuner, lease_generation);
+        return -1;
     }
 
-    char adapter_id[16];
-    snprintf(adapter_id, sizeof(adapter_id), "%d", t->id);
-
-    LOG_INFO("TRANSCODE", "Starting stream: %s (Codec: %d, Backend: %d, Adapter: %s)", 
-             config->channel_num, config->codec, config->backend, adapter_id);
-    
-    // Create pipe between dvbv5-zap and ffmpeg
-    int zap_pipe[2];
-    if (pipe(zap_pipe) < 0) {
-        LOG_ERROR("TRANSCODE", "Failed to create zap pipe");
-        send_stream_error(sockfd, "500 Internal Server Error", "Unable to create stream pipeline");
-        release_tuner(t, lease_generation);
-        return;
-    }
-    
-    // Create pipe for output to client (ffmpeg -> parent -> client)
-    int pipefds[2];
-    if (pipe(pipefds) < 0) {
-        LOG_ERROR("TRANSCODE", "Failed to create output pipe");
-        close(zap_pipe[0]);
-        close(zap_pipe[1]);
-        send_stream_error(sockfd, "500 Internal Server Error", "Unable to create stream pipeline");
-        release_tuner(t, lease_generation);
-        return;
+    pid_t group = fork();
+    if (group < 0) {
+        close(zap_pipe[0]); close(zap_pipe[1]);
+        close(output_pipe[0]); close(output_pipe[1]);
+        release_tuner(tuner, lease_generation);
+        return -1;
     }
 
-    // Fork main child process (group leader)
-    pid_t pid = fork();
-    if (pid < 0) {
-        LOG_ERROR("TRANSCODE", "Fork failed");
-        close(zap_pipe[0]);
-        close(zap_pipe[1]);
-        close(pipefds[0]);
-        close(pipefds[1]);
-        send_stream_error(sockfd, "500 Internal Server Error", "Unable to start stream pipeline");
-        release_tuner(t, lease_generation);
-        return;
-    }
-
-    if (pid > 0 && setpgid(pid, pid) < 0 && errno != EACCES && errno != ESRCH) {
-        LOG_WARN("TRANSCODE", "Parent setpgid failed for %d: %s", pid,
-                 strerror(errno));
-    }
-    
-    if (pid == 0) {
-        // Child: Setup process group
-        if (setpgid(0, 0) < 0) {
-             LOG_ERROR("TRANSCODE", "setpgid failed: %s", strerror(errno));
-             _exit(1);
-        }
-        
-        // IMPORTANT: Reset signal handlers inherited from parent!
-        // Otherwise, receiving SIGTERM (during kill(-pid)) will execute the 
-        // parent's handler which writes to the shutdown pipe, killing the server.
+    if (group == 0) {
+        if (setpgid(0, 0) < 0) _exit(1);
         signal(SIGINT, SIG_DFL);
         signal(SIGTERM, SIG_DFL);
-        
-        // Suppress stderr unless verbose mode is enabled
-        if (!g_verbose) {
-            int devnull = open("/dev/null", O_WRONLY);
-            if (devnull >= 0) {
-                dup2(devnull, STDERR_FILENO);
-                close(devnull);
-            }
-        }
 
-        // Fork dvbv5-zap
-        pid_t zap_pid = fork();
-        if (zap_pid == 0) {
-            // dvbv5-zap process
-            close(pipefds[0]); // Unused
-            close(pipefds[1]); // Unused
-            close(zap_pipe[0]); // Close read end
-            
-            // Redirect stdout to pipe
+        pid_t zap = fork();
+        if (zap == 0) {
+            close(output_pipe[0]); close(output_pipe[1]); close(zap_pipe[0]);
             dup2(zap_pipe[1], STDOUT_FILENO);
             close(zap_pipe[1]);
-            
-            // Direct exec without shell
-            // -p records only the selected service PIDs and adds PAT/PMT.
-            // Do not use -P here: all-PID mode makes FFmpeg select the first
-            // program on the multiplex instead of the requested subchannel.
-            execlp("dvbv5-zap", "dvbv5-zap", 
-                   "-c", channels_conf_path,
-                   "-a", adapter_id,
-                   "-p",
-                   "-o", "-",
-                   c->number, NULL);
+            char adapter[16];
+            snprintf(adapter, sizeof(adapter), "%d", tuner->id);
+            execlp("dvbv5-zap", "dvbv5-zap", "-c", channels_conf_path,
+                   "-a", adapter, "-p", "-o", "-", channel->number, NULL);
             _exit(1);
         }
-        
-        // Fork ffmpeg
-        if (zap_pid < 0) _exit(1);
+        if (zap < 0) _exit(1);
 
-        pid_t ffmpeg_pid = fork();
-        if (ffmpeg_pid == 0) {
-            // ffmpeg process
-            close(pipefds[0]); // Unused
-            
-            // Redirect stdin from zap pipe
+        pid_t ffmpeg = fork();
+        if (ffmpeg == 0) {
+            close(output_pipe[0]); close(zap_pipe[1]);
             dup2(zap_pipe[0], STDIN_FILENO);
-            close(zap_pipe[0]);
-            close(zap_pipe[1]); // Close write end
-            
-            // Redirect stdout to main pipe
-            dup2(pipefds[1], STDOUT_FILENO);
-            close(pipefds[1]);
-
-            // Construct argv for execvp directly
-            char *args[128];
-            int n = 0;
-            int err = 0; // Sticky error flag
-            
-            add_arg(args, &n, "ffmpeg", &err);
-            
-            // Input options (common)
-            add_arg(args, &n, "-fflags", &err); add_arg(args, &n, "+genpts+discardcorrupt", &err);
-            add_arg(args, &n, "-analyzeduration", &err); add_arg(args, &n, "1000000", &err);
-            add_arg(args, &n, "-probesize", &err); add_arg(args, &n, "5000000", &err);
-            add_arg(args, &n, "-thread_queue_size", &err); add_arg(args, &n, "512", &err);
-            
-            // Input file (stdin)
-            add_arg(args, &n, "-f", &err); add_arg(args, &n, "mpegts", &err);
-            add_arg(args, &n, "-i", &err); add_arg(args, &n, "-", &err);
-            
-            // Codec Configuration
-            char ac_str[8]; // Buffer for audio channels
-            char bitrate_str[16]; // Buffer for bitrate
-            
-            if (config->codec == CODEC_COPY) {
-                // Passthrough Mode
-                add_arg(args, &n, "-c", &err); add_arg(args, &n, "copy", &err);
-                
-                // Muxer flags for clean TS output
-                add_arg(args, &n, "-f", &err); add_arg(args, &n, "mpegts", &err);
-                add_arg(args, &n, "-mpegts_flags", &err); add_arg(args, &n, "+resend_headers", &err);
-                add_arg(args, &n, "-pat_period", &err); add_arg(args, &n, "0.1", &err);
-                add_arg(args, &n, "-sdt_period", &err); add_arg(args, &n, "0.5", &err);
-                
-            } else {
-                // Transcoding Mode
-                
-                // Hardware Acceleration Flags
-                switch (config->backend) {
-                    case BACKEND_QSV:
-                        add_arg(args, &n, "-hwaccel", &err); add_arg(args, &n, "qsv", &err);
-                        add_arg(args, &n, "-hwaccel_output_format", &err); add_arg(args, &n, "qsv", &err);
-                        add_arg(args, &n, "-init_hw_device", &err); add_arg(args, &n, "qsv=qsv:hw", &err);
-                        add_arg(args, &n, "-filter_hw_device", &err); add_arg(args, &n, "qsv", &err);
-                        break;
-                    case BACKEND_NVENC:
-                        add_arg(args, &n, "-hwaccel", &err); add_arg(args, &n, "cuda", &err);
-                        add_arg(args, &n, "-hwaccel_output_format", &err); add_arg(args, &n, "cuda", &err);
-                        break;
-                    case BACKEND_VAAPI:
-                        add_arg(args, &n, "-hwaccel", &err); add_arg(args, &n, "vaapi", &err);
-                        add_arg(args, &n, "-hwaccel_output_format", &err); add_arg(args, &n, "vaapi", &err);
-                        add_arg(args, &n, "-hwaccel_device", &err); add_arg(args, &n, find_vaapi_device(), &err);
-                        break;
-                    default: break;
-                }
-                
-                // Video Filters
-                add_arg(args, &n, "-vf", &err);
-                switch (config->backend) {
-                    case BACKEND_QSV: 
-                        // QSV Advanced deinterlacing (usually respects frame flags)
-                        add_arg(args, &n, "vpp_qsv=deinterlace=2", &err); 
-                        break;
-                    case BACKEND_NVENC: 
-                        // yadif_cuda: mode 0 (frame), parity -1 (auto), deint 1 (interlaced only)
-                        add_arg(args, &n, "yadif_cuda=0:-1:1", &err); 
-                        break;
-                    case BACKEND_VAAPI: 
-                        // VAAPI motion adaptive
-                        add_arg(args, &n, "deinterlace_vaapi", &err); 
-                        break;
-                    default: 
-                        // Software yadif: mode 0 (frame), parity -1 (auto), deint 1 (interlaced only)
-                        add_arg(args, &n, "yadif=0:-1:1,format=yuv420p", &err); 
-                        break;
-                }
-                
-                // Video Encoder & Options
-                add_arg(args, &n, "-c:v", &err);
-                
-                if (config->backend == BACKEND_QSV) {
-                    if (config->codec == CODEC_H264) {
-                        add_arg(args, &n, "h264_qsv", &err);
-                        add_arg(args, &n, "-look_ahead", &err); add_arg(args, &n, "0", &err);
-                        add_arg(args, &n, "-async_depth", &err); add_arg(args, &n, "1", &err);
-                    } else if (config->codec == CODEC_HEVC) {
-                         add_arg(args, &n, "hevc_qsv", &err);
-                         add_arg(args, &n, "-look_ahead", &err); add_arg(args, &n, "0", &err);
-                         add_arg(args, &n, "-async_depth", &err); add_arg(args, &n, "1", &err);
-                    } else if (config->codec == CODEC_AV1) {
-                         add_arg(args, &n, "av1_qsv", &err);
-                         add_arg(args, &n, "-async_depth", &err); add_arg(args, &n, "1", &err);
-                    }
-                } else if (config->backend == BACKEND_NVENC) {
-                    if (config->codec == CODEC_H264) add_arg(args, &n, "h264_nvenc", &err);
-                    else if (config->codec == CODEC_HEVC) add_arg(args, &n, "hevc_nvenc", &err);
-                    else if (config->codec == CODEC_AV1) add_arg(args, &n, "av1_nvenc", &err);
-                    
-                    add_arg(args, &n, "-preset", &err); add_arg(args, &n, "p1", &err);
-                    add_arg(args, &n, "-tune", &err); add_arg(args, &n, "ll", &err);
-                    if (config->codec != CODEC_AV1) { // AV1 nvenc might not support zerolatency flag in all versions
-                         add_arg(args, &n, "-zerolatency", &err); add_arg(args, &n, "1", &err);
-                    }
-                } else if (config->backend == BACKEND_VAAPI) {
-                    if (config->codec == CODEC_H264) add_arg(args, &n, "h264_vaapi", &err);
-                    else if (config->codec == CODEC_HEVC) add_arg(args, &n, "hevc_vaapi", &err);
-                    else if (config->codec == CODEC_AV1) add_arg(args, &n, "av1_vaapi", &err);
-                    if (config->codec != CODEC_AV1) {
-                        add_arg(args, &n, "-compression_level", &err); add_arg(args, &n, "0", &err);
-                    }
-                } else { // SOFTWARE
-                    if (config->codec == CODEC_HEVC) {
-                        add_arg(args, &n, "libx265", &err);
-                        add_arg(args, &n, "-preset", &err); add_arg(args, &n, "ultrafast", &err);
-                    } else if (config->codec == CODEC_AV1) {
-                        add_arg(args, &n, "libsvtav1", &err);
-                        add_arg(args, &n, "-preset", &err); add_arg(args, &n, "12", &err);
-                    } else {
-                        add_arg(args, &n, "libx264", &err);
-                        add_arg(args, &n, "-preset", &err); add_arg(args, &n, "ultrafast", &err);
-                        add_arg(args, &n, "-tune", &err); add_arg(args, &n, "zerolatency", &err);
-                    }
-                }
-
-                // Rate Control
-                int rate = config->bitrate_kbps;
-                if (rate > 0) {
-                     snprintf(bitrate_str, sizeof(bitrate_str), "%dk", rate);
-                     add_arg(args, &n, "-b:v", &err); add_arg(args, &n, bitrate_str, &err);
-                     
-                     if (config->backend != BACKEND_SOFTWARE || config->codec != CODEC_AV1) {
-                         // SVT-AV1 has different RC params, simple copy logic skips -maxrate for it
-                         char maxrate_str[16];
-                         snprintf(maxrate_str, sizeof(maxrate_str), "%dk", rate * 2);
-                         add_arg(args, &n, "-maxrate", &err); add_arg(args, &n, maxrate_str, &err);
-                         
-                         char bufsize_str[16];
-                         snprintf(bufsize_str, sizeof(bufsize_str), "%dk", rate * 4);
-                         add_arg(args, &n, "-bufsize", &err); add_arg(args, &n, bufsize_str, &err);
-                     }
-                }
-
-                // GOP Size
-                add_arg(args, &n, "-g", &err); add_arg(args, &n, "60", &err);
-
-                // Audio Codec
-                add_arg(args, &n, "-c:a", &err); add_arg(args, &n, "aac", &err);
-                add_arg(args, &n, "-ac", &err); 
-                snprintf(ac_str, sizeof(ac_str), "%d", config->audio_channels);
-                add_arg(args, &n, ac_str, &err);
-                
-                // Output Format
-                add_arg(args, &n, "-f", &err);
-                if (config->backend == BACKEND_SOFTWARE && config->codec == CODEC_AV1) {
-                    add_arg(args, &n, "matroska", &err);
-                } else {
-                    add_arg(args, &n, "mpegts", &err);
-                    add_arg(args, &n, "-mpegts_flags", &err); add_arg(args, &n, "+resend_headers", &err);
-                    add_arg(args, &n, "-pat_period", &err); add_arg(args, &n, "0.1", &err);
-                    add_arg(args, &n, "-sdt_period", &err); add_arg(args, &n, "0.5", &err);
-                }
-            }
-            
-            add_arg(args, &n, "-", &err); // Output to stdout
-            args[n] = NULL;
-            
-            // Check for sticky error (overflow detected during build)
-            if (err) {
-                LOG_ERROR("TRANSCODE", "FFmpeg argument construction failed (overflow), aborting stream");
-                _exit(1);
-            }
-            
-            execvp("ffmpeg", args);
+            dup2(output_pipe[1], STDOUT_FILENO);
+            close(zap_pipe[0]); close(output_pipe[1]);
+            char *arguments[128] = {0};
+            int argument_error = 0;
+            build_ffmpeg_arguments(config, arguments, &argument_error);
+            if (argument_error) _exit(1);
+            execvp("ffmpeg", arguments);
             _exit(1);
         }
-        
-        if (ffmpeg_pid < 0) {
-            kill(zap_pid, SIGTERM);
-            waitpid(zap_pid, NULL, 0);
+        close(zap_pipe[0]); close(zap_pipe[1]);
+        close(output_pipe[0]); close(output_pipe[1]);
+        if (ffmpeg < 0) {
+            kill(zap, SIGTERM);
+            waitpid(zap, NULL, 0);
             _exit(1);
         }
-
-        // Parent of zap/ffmpeg (Stream Group Leader)
-        close(zap_pipe[0]);
-        close(zap_pipe[1]);
-        close(pipefds[1]); // Close write end
-        
-        // Stream Monitor process
-        close(pipefds[0]); // Monitor doesn't read
-        
-        // Wait for both children
-        wait(NULL);
-        wait(NULL);
+        waitpid(zap, NULL, 0);
+        waitpid(ffmpeg, NULL, 0);
         _exit(0);
     }
-    
-    // Parent
-    close(zap_pipe[0]); 
-    close(zap_pipe[1]); // Ensure these are closed in parent too
-    
-    // Enable TCP keepalive to detect dead connections
-    int keepalive = 1;
-    int keepidle = 10;   // Start probing after 10 seconds idle
-    int keepintvl = 5;   // Probe every 5 seconds
-    int keepcnt = 3;     // Give up after 3 failed probes
-    setsockopt(sockfd, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive));
-    setsockopt(sockfd, IPPROTO_TCP, TCP_KEEPIDLE, &keepidle, sizeof(keepidle));
-    setsockopt(sockfd, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl, sizeof(keepintvl));
-    setsockopt(sockfd, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, sizeof(keepcnt));
-    
-    // TCP_NODELAY: Disable Nagle's algorithm for lower latency streaming
-    int nodelay = 1;
-    setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
-    
-    // Larger send buffer for smoother streaming (256KB)
-    int sndbuf = 256 * 1024;
-    setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
-    
-    // Set socket send timeout (shorter for streaming)
-    struct timeval tv = { .tv_sec = 10, .tv_usec = 0 };
-    setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-    
-    // Use poll to monitor both pipe and socket for errors
-    struct pollfd fds[2];
-    fds[0].fd = pipefds[0];  // Pipe from dvbv5-zap/ffmpeg
-    fds[0].events = POLLIN;
-    fds[1].fd = sockfd;      // Client socket
-    fds[1].events = 0;       // Only care about errors/hangup (always reported)
-    
-    char buffer[65536];
-    ssize_t n;
+
+    if (setpgid(group, group) < 0 && errno != EACCES && errno != ESRCH) {
+        LOG_WARN("TRANSCODE", "Unable to set process group %d: %s", group, strerror(errno));
+    }
+    close(zap_pipe[0]); close(zap_pipe[1]); close(output_pipe[1]);
+
+    PipelineContext *context = calloc(1, sizeof(*context));
+    if (!context) {
+        close(output_pipe[0]);
+        terminate_process_group(group);
+        release_tuner(tuner, lease_generation);
+        return -1;
+    }
+    context->process_group = group;
+    context->tuner = tuner;
+    context->lease_generation = lease_generation;
+    producer->fd = output_pipe[0];
+    producer->opaque = context;
+    LOG_INFO("TRANSCODE",
+             "Producer started: channel=%s codec=%d backend=%d container=%s adapter=%d",
+             config->channel_num, config->codec, config->backend,
+             stream_config_extension(config), tuner->id);
+    return 0;
+}
+
+static void stop_pipeline(StreamProducer *producer) {
+    if (!producer) return;
+    if (producer->fd >= 0) {
+        close(producer->fd);
+        producer->fd = -1;
+    }
+    PipelineContext *context = producer->opaque;
+    if (context) {
+        terminate_process_group(context->process_group);
+        release_tuner(context->tuner, context->lease_generation);
+        LOG_INFO("TRANSCODE", "Producer stopped (group=%d)", context->process_group);
+        free(context);
+    }
+    producer->opaque = NULL;
+}
+
+static void initialize_sessions(void) {
+    const StreamProducerOps operations = {
+        .start = start_pipeline,
+        .stop = stop_pipeline
+    };
+    sessions_ready = stream_sessions_init(&operations);
+}
+
+static void configure_stream_socket(int socket_fd) {
+    int enabled = 1;
+    int keepidle = 10;
+    int keepintvl = 5;
+    int keepcnt = 3;
+    int send_buffer = 256 * 1024;
+    struct timeval timeout = { .tv_sec = 10, .tv_usec = 0 };
+    setsockopt(socket_fd, SOL_SOCKET, SO_KEEPALIVE, &enabled, sizeof(enabled));
+    setsockopt(socket_fd, IPPROTO_TCP, TCP_KEEPIDLE, &keepidle, sizeof(keepidle));
+    setsockopt(socket_fd, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl, sizeof(keepintvl));
+    setsockopt(socket_fd, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, sizeof(keepcnt));
+    setsockopt(socket_fd, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled));
+    setsockopt(socket_fd, SOL_SOCKET, SO_SNDBUF, &send_buffer, sizeof(send_buffer));
+    setsockopt(socket_fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+}
+
+void handle_unified_stream(int socket_fd,
+                           StreamConfig *config,
+                           const char *http_header) {
+    pthread_once(&session_init_once, initialize_sessions);
+    if (!sessions_ready) {
+        send_stream_error(socket_fd, "500 Internal Server Error",
+                          "Stream session manager is unavailable");
+        return;
+    }
+
+    uint64_t cursor = 0;
+    StreamSession *session = stream_session_acquire(config, &cursor);
+    if (!session) {
+        send_stream_error(socket_fd, "503 Service Unavailable",
+                          "No stream session is available");
+        return;
+    }
+
+    configure_stream_socket(socket_fd);
+    unsigned char buffer[65536];
     int header_sent = 0;
-    int child_reaped = 0;
-    time_t stream_started = monotonic_seconds();
-    time_t last_data = stream_started;
-    
+    int64_t started = monotonic_milliseconds();
+    int64_t last_data = started;
+
     while (1) {
-        int ret = poll(fds, 2, 1000);
-
-        if (ret == 0) {
-            int status;
-            pid_t child_state = waitpid(pid, &status, WNOHANG);
-            if (child_state == pid) {
-                child_reaped = 1;
-                if (!header_sent) {
-                    send_stream_error(sockfd, "502 Bad Gateway",
-                                      "Stream pipeline exited before producing data");
-                }
-                break;
-            }
-
-            time_t now = monotonic_seconds();
-            int timeout = header_sent ? STREAM_STALL_TIMEOUT_SECONDS
-                                      : STREAM_START_TIMEOUT_SECONDS;
-            time_t reference = header_sent ? last_data : stream_started;
-            if (now > 0 && reference > 0 && now - reference >= timeout) {
-                LOG_WARN("TRANSCODE", "%s timeout after %d seconds for %s",
-                         header_sent ? "Stream stall" : "Stream startup",
-                         timeout, config->channel_num);
-                if (!header_sent) {
-                    send_stream_error(sockfd, "504 Gateway Timeout",
-                                      "Timed out waiting for broadcast data");
-                }
-                break;
-            }
-            continue;
-        }
-
-        if (ret < 0) {
-            if (errno == EINTR) continue;
-            LOG_WARN("TRANSCODE", "poll() error: %s", strerror(errno));
-            break;
-        }
-        
-        // Check for socket errors/hangup (client disconnected)
-        if (fds[1].revents & (POLLERR | POLLHUP | POLLNVAL)) {
-            LOG_INFO("TRANSCODE", "Client socket error/hangup detected, killing stream group %d", pid);
-            break;
-        }
-        
-        // Check for data from pipe
-        if (fds[0].revents & POLLIN) {
-            n = read(pipefds[0], buffer, sizeof(buffer));
-            if (n <= 0) {
-                if (n < 0 && errno == EINTR) continue;
-                break;  // EOF or error
-            }
-            last_data = monotonic_seconds();
-            
-            // Send HTTP header on first data chunk (deferred response)
+        ssize_t bytes = stream_session_read(session, &cursor, buffer,
+                                            sizeof(buffer), 1000);
+        if (bytes > 0) {
             if (!header_sent) {
-                if (!write_all(sockfd, http_header, strlen(http_header))) {
-                    LOG_INFO("TRANSCODE", "Client disconnected before stream started");
-                    break;
-                }
+                if (!write_all(socket_fd, http_header, strlen(http_header))) break;
                 header_sent = 1;
             }
-            
-            if (!write_all(sockfd, buffer, n)) {
-                LOG_INFO("TRANSCODE", "Client disconnected, killing stream group %d", pid);
-                break;
-            }
+            if (!write_all(socket_fd, buffer, (size_t)bytes)) break;
+            last_data = monotonic_milliseconds();
+            continue;
         }
-        
-        // Check for pipe errors (process died)
-        if (fds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) {
-            // Drain any remaining data
-            while ((n = read(pipefds[0], buffer, sizeof(buffer))) > 0) {
-                if (!header_sent) {
-                    if (!write_all(sockfd, http_header, strlen(http_header))) break;
-                    header_sent = 1;
-                }
-                if (!write_all(sockfd, buffer, n)) break;
-            }
+        if (bytes == -2) {
+            LOG_WARN("SESSION", "Slow subscriber overran buffer for %s",
+                     config->channel_num);
+            break;
+        }
+        if (bytes < 0) {
             if (!header_sent) {
-                send_stream_error(sockfd, "502 Bad Gateway",
-                                  "Stream pipeline produced no data");
+                send_stream_error(socket_fd, "502 Bad Gateway",
+                                  stream_session_error(session));
+            }
+            break;
+        }
+
+        struct pollfd client = { .fd = socket_fd, .events = 0 };
+        if (poll(&client, 1, 0) > 0 &&
+            client.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+            break;
+        }
+        int64_t now = monotonic_milliseconds();
+        int timeout = header_sent ? STREAM_STALL_TIMEOUT_SECONDS
+                                  : STREAM_START_TIMEOUT_SECONDS;
+        int64_t reference = header_sent ? last_data : started;
+        if (now > 0 && reference > 0 && now - reference >= timeout * 1000LL) {
+            if (!header_sent) {
+                send_stream_error(socket_fd, "504 Gateway Timeout",
+                                  "Timed out waiting for broadcast data");
             }
             break;
         }
     }
 
-    // Cleanup
-    close(pipefds[0]);
-    if (!child_reaped) terminate_process_group(pid, &child_reaped);
-    release_tuner(t, lease_generation);
-    LOG_INFO("TRANSCODE", "Stream ended for %s", config->channel_num);
+    stream_session_release(session);
+    LOG_INFO("SESSION", "Subscriber ended for %s", config->channel_num);
+}
+
+void shutdown_stream_sessions(void) {
+    if (sessions_ready) stream_sessions_shutdown();
 }

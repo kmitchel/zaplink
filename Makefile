@@ -12,6 +12,7 @@ SERVICE_DIR = /etc/systemd/system
 
 SRCS = $(SRC_DIR)/main.c $(SRC_DIR)/channels.c $(SRC_DIR)/db.c $(SRC_DIR)/epg.c \
        $(SRC_DIR)/huffman.c $(SRC_DIR)/scanner.c $(SRC_DIR)/tuner.c \
+       $(SRC_DIR)/stream_config.c $(SRC_DIR)/stream_session.c \
        $(SRC_DIR)/transcode.c $(SRC_DIR)/http_server.c $(SRC_DIR)/benchmark.c \
        $(SRC_DIR)/thread_pool.c
 
@@ -19,7 +20,8 @@ OBJS = $(patsubst $(SRC_DIR)/%.c, $(OBJ_DIR)/%.o, $(SRCS))
 
 TARGET = $(BUILD_DIR)/zaplink
 TEST_TARGET = $(BUILD_DIR)/test_channels
-TEST_TARGETS = $(TEST_TARGET) $(BUILD_DIR)/test_tuner $(BUILD_DIR)/test_db_concurrency
+TEST_TARGETS = $(TEST_TARGET) $(BUILD_DIR)/test_tuner $(BUILD_DIR)/test_db_concurrency \
+               $(BUILD_DIR)/test_stream_config $(BUILD_DIR)/test_stream_session
 
 all: $(TARGET)
 
@@ -47,10 +49,21 @@ $(BUILD_DIR)/test_tuner: tests/test_tuner.c $(OBJ_DIR)/tuner.o
 $(BUILD_DIR)/test_db_concurrency: tests/test_db_concurrency.c $(OBJ_DIR)/db.o $(OBJ_DIR)/channels.o
 	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
+$(BUILD_DIR)/test_stream_config: tests/test_stream_config.c $(OBJ_DIR)/stream_config.o
+	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@ $(LDFLAGS)
+
+$(BUILD_DIR)/test_stream_session: tests/test_stream_session.c $(OBJ_DIR)/stream_session.o $(OBJ_DIR)/stream_config.o
+	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@ $(LDFLAGS)
+
 test: $(TARGET) $(TEST_TARGETS)
 	$(BUILD_DIR)/test_channels
 	$(BUILD_DIR)/test_tuner
 	$(BUILD_DIR)/test_db_concurrency
+	$(BUILD_DIR)/test_stream_config
+	$(BUILD_DIR)/test_stream_session
+
+http-contract-test: $(TARGET)
+	tests/test_http_contract.sh "$${ZAPLINK_TEST_BASE_URL:-http://127.0.0.1:18392}" "$${ZAPLINK_TEST_CHANNEL:-15.1}" "$${ZAPLINK_TEST_SERVER_PID:-}"
 
 install: $(TARGET)
 	@echo "Installing ZapLink..."
@@ -68,4 +81,4 @@ install: $(TARGET)
 	systemctl daemon-reload
 	@echo "Installed. Service enabled. Start with: systemctl start zaplink"
 
-.PHONY: all clean install test
+.PHONY: all clean install test http-contract-test
