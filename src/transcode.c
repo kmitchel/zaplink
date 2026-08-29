@@ -318,6 +318,17 @@ static int start_pipeline(const StreamConfig *config, StreamProducer *producer) 
         signal(SIGINT, SIG_DFL);
         signal(SIGTERM, SIG_DFL);
 
+        /* Pipeline shutdown closes pipes by design. Keep the resulting
+         * dvbv5-zap/FFmpeg diagnostics out of normal service logs, matching
+         * the historical non-verbose behavior. */
+        if (!g_verbose) {
+            int devnull = open("/dev/null", O_WRONLY);
+            if (devnull >= 0) {
+                dup2(devnull, STDERR_FILENO);
+                close(devnull);
+            }
+        }
+
         pid_t zap = fork();
         if (zap == 0) {
             close(output_pipe[0]); close(output_pipe[1]); close(zap_pipe[0]);
