@@ -285,9 +285,21 @@ To use ZapLink with Jellyfin:
    - **File or URL**: `http://<ip>:18392/xmltv.xml`
 4. Save and click **Refresh Guide Data**.
 
-After upgrading from a version that generated extensionless stream URLs,
-refresh the tuner/guide data so clients receive the new `.ts` or `.mkv` URLs.
-Saved extensionless URLs continue working during the transition.
+> [!IMPORTANT]
+> **Upgrading from Extensionless URLs (`Unable to find host to play channel` error):**
+> Jellyfin generates its internal channel keys and `MediaSource.Id` by MD5-hashing the exact stream URL found in `playlist.m3u`.
+> When upgrading from extensionless stream URLs (`/stream/15.1`) to extension-based URLs (`/stream/15.1.ts`), existing channel mappings, series recording timers, and client caches in Jellyfin will still reference the old hash. Attempting playback before refreshing will trigger:
+> ```text
+> MediaBrowser.Controller.LiveTv.LiveTvConflictException: Unable to find host to play channel
+> ```
+> Or in the Jellyfin client UI: `"This Item can not be played"` / `"Playback Error"`.
+>
+> **Required Migration Steps:**
+> 1. In Jellyfin, go to **Administration > Dashboard > Live TV**.
+> 2. Under **Tuner Devices**, click on your M3U Tuner and click **Save** (or click the three dots `...` to refresh).
+> 3. Under **TV Guide Data Providers**, click the three dots `...` next to your XMLTV provider and select **Refresh Guide Data**.
+> 4. **Hard-refresh your browser/client** (`Ctrl + F5` or `Cmd + Shift + R`) or restart the Jellyfin app so the client loads the new active channel IDs.
+> 5. If you have existing series recording timers created under old channel hashes, verify and re-save them under the updated guide channels.
 
 To verify the live transport independently of Jellyfin, request a known active
 channel for a bounded interval:
