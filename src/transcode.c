@@ -142,24 +142,17 @@ void build_ffmpeg_arguments(const StreamConfig *config,
     add_arg(arguments, &count, probe, argument_error);
     add_arg(arguments, &count, "-thread_queue_size", argument_error);
     add_arg(arguments, &count, "512", argument_error);
-    add_arg(arguments, &count, "-f", argument_error);
-    add_arg(arguments, &count, "mpegts", argument_error);
-    add_arg(arguments, &count, "-i", argument_error);
-    add_arg(arguments, &count, "-", argument_error);
-
-    if (config->codec == CODEC_COPY) {
-        add_arg(arguments, &count, "-c", argument_error);
-        add_arg(arguments, &count, "copy", argument_error);
-    } else {
+    static _Thread_local char vaapi_init[128];
+    if (config->codec != CODEC_COPY) {
         switch (config->backend) {
             case BACKEND_QSV:
-                add_arg(arguments, &count, "-hwaccel", argument_error);
-                add_arg(arguments, &count, "qsv", argument_error);
-                add_arg(arguments, &count, "-hwaccel_output_format", argument_error);
-                add_arg(arguments, &count, "qsv", argument_error);
                 add_arg(arguments, &count, "-init_hw_device", argument_error);
                 add_arg(arguments, &count, "qsv=qsv:hw", argument_error);
                 add_arg(arguments, &count, "-filter_hw_device", argument_error);
+                add_arg(arguments, &count, "qsv", argument_error);
+                add_arg(arguments, &count, "-hwaccel", argument_error);
+                add_arg(arguments, &count, "qsv", argument_error);
+                add_arg(arguments, &count, "-hwaccel_output_format", argument_error);
                 add_arg(arguments, &count, "qsv", argument_error);
                 break;
             case BACKEND_NVENC:
@@ -169,17 +162,32 @@ void build_ffmpeg_arguments(const StreamConfig *config,
                 add_arg(arguments, &count, "cuda", argument_error);
                 break;
             case BACKEND_VAAPI:
+                snprintf(vaapi_init, sizeof(vaapi_init), "vaapi=va:%s", find_vaapi_device());
+                add_arg(arguments, &count, "-init_hw_device", argument_error);
+                add_arg(arguments, &count, vaapi_init, argument_error);
+                add_arg(arguments, &count, "-filter_hw_device", argument_error);
+                add_arg(arguments, &count, "va", argument_error);
                 add_arg(arguments, &count, "-hwaccel", argument_error);
                 add_arg(arguments, &count, "vaapi", argument_error);
                 add_arg(arguments, &count, "-hwaccel_output_format", argument_error);
                 add_arg(arguments, &count, "vaapi", argument_error);
                 add_arg(arguments, &count, "-hwaccel_device", argument_error);
-                add_arg(arguments, &count, find_vaapi_device(), argument_error);
+                add_arg(arguments, &count, "va", argument_error);
                 break;
             default:
                 break;
         }
+    }
 
+    add_arg(arguments, &count, "-f", argument_error);
+    add_arg(arguments, &count, "mpegts", argument_error);
+    add_arg(arguments, &count, "-i", argument_error);
+    add_arg(arguments, &count, "-", argument_error);
+
+    if (config->codec == CODEC_COPY) {
+        add_arg(arguments, &count, "-c", argument_error);
+        add_arg(arguments, &count, "copy", argument_error);
+    } else {
         add_arg(arguments, &count, "-vf", argument_error);
         switch (config->backend) {
             case BACKEND_QSV:
