@@ -39,7 +39,7 @@ static int read_exact(int fd, void *buffer, size_t length) {
 }
 
 static int huffman_load(void) {
-    int fd = open("huffman.bin", O_RDONLY);
+    int fd = open("huffman.bin", O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
         // Not a fatal error, but decoding won't work
         LOG_DEBUG("HUFFMAN", "huffman.bin not found, Huffman decoding disabled");

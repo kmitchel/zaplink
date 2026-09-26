@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 /**
  * @file epg.c
  * @brief Electronic Program Guide collection from ATSC broadcasts
@@ -775,7 +776,7 @@ void parse_atsc_ett(ScanContext *ctx, const unsigned char *section, int len) {
 void scan_mux(Tuner *t, unsigned long lease_generation, ScanContext *ctx,
               const char *channel_number, const char *channel_name) {
     int pipefd[2];
-    if (pipe(pipefd) == -1) return;
+    if (pipe2(pipefd, O_CLOEXEC) == -1) return;
     
     LOG_INFO("EPG", "Scanning Mux %s (%s %s) on Tuner %d", ctx->freq, channel_name, channel_number, t->id);
 

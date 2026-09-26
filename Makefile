@@ -80,6 +80,14 @@ test: $(TARGET) $(TEST_TARGETS)
 	$(BUILD_DIR)/test_transcode
 	$(BUILD_DIR)/test_huffman
 	tests/test_http_contract.sh
+	$(MAKE) http-descriptor-test
+
+$(BUILD_DIR)/zaplink_no_tuner_test: $(SRCS)
+	@mkdir -p $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -DTUNER_WAIT_TIMEOUT_SECONDS=0 $^ -o $@ $(LDFLAGS)
+
+http-descriptor-test: $(BUILD_DIR)/zaplink_no_tuner_test
+	python3 tests/test_http_descriptors.py
 
 http-contract-test: $(TARGET)
 	tests/test_http_contract.sh
@@ -100,4 +108,4 @@ install: $(TARGET)
 	systemctl daemon-reload
 	@echo "Installed. Service enabled. Start with: systemctl start zaplink"
 
-.PHONY: all clean install test http-contract-test
+.PHONY: all clean install test http-contract-test http-descriptor-test

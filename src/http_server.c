@@ -397,7 +397,7 @@ void process_client_request(void *arg) {
 int start_http_server(int port) {
     int result = 1;
     http_running = 1;
-    if (pipe(shutdown_pipe) < 0) {
+    if (pipe2(shutdown_pipe, O_CLOEXEC) < 0) {
         LOG_ERROR("HTTP", "Failed to create shutdown pipe: %s", strerror(errno));
         goto startup_failure;
     }
@@ -417,7 +417,7 @@ int start_http_server(int port) {
         goto startup_failure;
     }
 
-    server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    server_fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (server_fd < 0) {
         LOG_ERROR("HTTP", "Failed to create socket: %s", strerror(errno));
         goto startup_failure;
@@ -438,7 +438,7 @@ int start_http_server(int port) {
         goto startup_failure;
     }
 
-    epoll_fd = epoll_create1(0);
+    epoll_fd = epoll_create1(EPOLL_CLOEXEC);
     if (epoll_fd < 0) {
         LOG_ERROR("HTTP", "Failed to create epoll: %s", strerror(errno));
         goto startup_failure;
@@ -483,7 +483,8 @@ int start_http_server(int port) {
             if (events[i].data.ptr == &listener_token) {
                 struct sockaddr_in client_addr;
                 socklen_t client_len = sizeof(client_addr);
-                int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
+                int client_fd = accept4(server_fd, (struct sockaddr *)&client_addr,
+                                        &client_len, SOCK_CLOEXEC);
                 if (client_fd < 0) {
                     if (errno != EAGAIN && errno != EWOULDBLOCK) LOG_WARN("HTTP", "accept failed");
                     continue;
