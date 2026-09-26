@@ -23,7 +23,7 @@ TARGET = $(BUILD_DIR)/zaplink
 TEST_TARGET = $(BUILD_DIR)/test_channels
 TEST_TARGETS = $(TEST_TARGET) $(BUILD_DIR)/test_tuner $(BUILD_DIR)/test_db_concurrency \
                $(BUILD_DIR)/test_stream_config $(BUILD_DIR)/test_stream_session \
-               $(BUILD_DIR)/test_transcode $(BUILD_DIR)/test_huffman $(BUILD_DIR)/test_db_busy
+               $(BUILD_DIR)/test_transcode $(BUILD_DIR)/test_huffman $(BUILD_DIR)/test_db_busy $(BUILD_DIR)/test_scanner
 
 all: $(TARGET)
 
@@ -44,6 +44,9 @@ clean:
 
 $(TEST_TARGET): tests/test_channels.c $(OBJ_DIR)/channels.o
 	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@ $(LDFLAGS)
+
+$(BUILD_DIR)/test_scanner: tests/test_scanner.c src/scanner.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 $(BUILD_DIR)/test_tuner: tests/test_tuner.c $(OBJ_DIR)/tuner.o
 	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@ $(LDFLAGS)
@@ -68,6 +71,7 @@ $(BUILD_DIR)/test_huffman: tests/test_huffman.c $(OBJ_DIR)/huffman.o
 
 test: $(TARGET) $(TEST_TARGETS)
 	$(BUILD_DIR)/test_channels
+	$(BUILD_DIR)/test_scanner
 	$(BUILD_DIR)/test_tuner
 	$(BUILD_DIR)/test_db_concurrency
 	$(BUILD_DIR)/test_db_busy

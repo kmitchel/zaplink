@@ -505,6 +505,7 @@ static int run_parallel_scan(int num_adapters, char part_files[][128],
     ScanWorker workers[MAX_ADAPTERS];
     memset(workers, 0, sizeof(workers));
     int active_workers = 0;
+    int worker_failed = 0;
     
     printf("\n[SCANNER] Starting parallel scan on %d tuners...\n", num_adapters);
     
@@ -512,6 +513,7 @@ static int run_parallel_scan(int num_adapters, char part_files[][128],
         int pipefd[2];
         if (pipe(pipefd) < 0) {
             perror("pipe");
+            worker_failed = 1;
             continue;
         }
         
@@ -550,6 +552,7 @@ static int run_parallel_scan(int num_adapters, char part_files[][128],
             close(pipefd[0]);
             close(pipefd[1]);
             LOG_ERROR("SCANNER", "Unable to fork scanner for adapter %d", i);
+            worker_failed = 1;
         }
     }
     
@@ -667,9 +670,23 @@ static int run_parallel_scan(int num_adapters, char part_files[][128],
             (!WIFEXITED(workers[i].wait_status) ||
              WEXITSTATUS(workers[i].wait_status) != 0)) {
             LOG_WARN("SCANNER", "Scan worker %d exited unsuccessfully", i);
+            worker_failed = 1;
+        } else if (!workers[i].status_valid) {
+            LOG_WARN("SCANNER", "Scan worker %d did not finish", i);
+            worker_failed = 1;
         }
     }
-    
+
+    if (worker_failed) {
+        for (int i = 0; i < num_adapters; i++) {
+            char part_out[128];
+            snprintf(part_out, sizeof(part_out), "%s.out", part_files[i]);
+            unlink(part_out);
+            unlink(part_files[i]);
+        }
+        return 0;
+    }
+
     // Merge
     printf("[SCANNER] Merging results...\n");
     int valid_parts = 0;
@@ -708,8 +725,8 @@ static int run_parallel_scan(int num_adapters, char part_files[][128],
             int ch;
             while ((ch = fgetc(src)) != EOF) fputc(ch, dest);
             fclose(src);
-            unlink(part_out); // Cleanup
         }
+        unlink(part_out);
         unlink(part_files[i]); // Cleanup input part
     }
     int ok = !ferror(dest) && fflush(dest) == 0;
