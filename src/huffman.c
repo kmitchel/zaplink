@@ -186,32 +186,39 @@ int huffman_decode(int compr_type, const uint8_t *src, int src_len, char *dest, 
     int dest_pos = (int)existing;
     int prev_char = 0; // Standard says initial context is 0x00
 
-    while (bit_pos < max_bits && dest_pos < dest_len - 1) {
-        // Select tree based on previous character (1st-order conditional)
-        // A/65 Annex C: Context is the previous 7-bit character
-        int context = (prev_char & 0x7F);
-        HuffmanNode *tree = base_trees + (context * nodes_per_tree);
-        int node_idx = 0;
-
-        // Traverse tree
-        while (node_idx >= 0) {
-            if (node_idx >= nodes_per_tree) return 0;
-            if (bit_pos >= max_bits) break;
-            int bit = get_bit(src, bit_pos++);
-            node_idx = tree[node_idx].children[bit];
-        }
-
-        if (node_idx < 0) {
-            unsigned char c = (unsigned char)(-(node_idx + 1));
-            if (c == 0x00) break; // End of string
-            dest[dest_pos++] = c;
-            prev_char = c;
+    for (;;) {
+        if (bit_pos >= max_bits) break; // No end-of-string code
+        unsigned char c;
+        if (prev_char >= 128) {
+            // A/65 Annex C: characters after Latin-1 bytes are uncompressed.
+            if (max_bits - bit_pos < 8) break;
+            c = 0;
+            for (int i = 0; i < 8; i++) c = (unsigned char)((c << 1) | get_bit(src, bit_pos++));
         } else {
-            // Incomplete traversal
-            break;
+            HuffmanNode *tree = base_trees + (prev_char * nodes_per_tree);
+            int node_idx = 0;
+            while (node_idx >= 0 && bit_pos < max_bits) {
+                if (node_idx >= nodes_per_tree) break;
+                node_idx = tree[node_idx].children[get_bit(src, bit_pos++)];
+            }
+            if (node_idx >= 0) break; // Truncated code or invalid tree
+            c = (unsigned char)(-(node_idx + 1));
+            if (c == 27) {
+                // The symbol after an order-1 escape is a literal 8-bit byte.
+                if (max_bits - bit_pos < 8) break;
+                c = 0;
+                for (int i = 0; i < 8; i++) c = (unsigned char)((c << 1) | get_bit(src, bit_pos++));
+            }
         }
+        if (c == 0) {
+            dest[dest_pos] = '\0';
+            return 1;
+        }
+        if (dest_pos >= dest_len - 1) break;
+        dest[dest_pos++] = (char)c;
+        prev_char = c;
     }
 
     dest[dest_pos] = '\0';
-    return 1;
+    return 0;
 }

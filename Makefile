@@ -25,7 +25,10 @@ TEST_TARGETS = $(TEST_TARGET) $(BUILD_DIR)/test_tuner $(BUILD_DIR)/test_db_concu
                $(BUILD_DIR)/test_stream_config $(BUILD_DIR)/test_stream_session \
                $(BUILD_DIR)/test_transcode $(BUILD_DIR)/test_huffman $(BUILD_DIR)/test_db_busy $(BUILD_DIR)/test_scanner
 
-all: $(TARGET)
+all: $(TARGET) huffman.bin
+
+huffman.bin: support/gen_huffman.py support/atsc_huffman_tables.txt
+	python3 support/gen_huffman.py
 
 $(TARGET): $(OBJS)
 	@mkdir -p $(BUILD_DIR)
@@ -66,16 +69,17 @@ $(BUILD_DIR)/test_stream_session: tests/test_stream_session.c $(OBJ_DIR)/stream_
 $(BUILD_DIR)/test_transcode: tests/test_transcode.c $(OBJ_DIR)/transcode.o $(OBJ_DIR)/stream_config.o $(OBJ_DIR)/tuner.o $(OBJ_DIR)/channels.o $(OBJ_DIR)/stream_session.o
 	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
-$(BUILD_DIR)/test_huffman: tests/test_huffman.c $(OBJ_DIR)/huffman.o
-	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@ $(LDFLAGS)
+$(BUILD_DIR)/test_huffman: tests/test_huffman.c $(OBJ_DIR)/huffman.o huffman.bin
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(OBJ_DIR)/huffman.o -o $@ $(LDFLAGS)
 
 $(BUILD_DIR)/check_huffman_asset: tests/check_huffman_asset.c $(OBJ_DIR)/huffman.o
 	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
-check-huffman: $(BUILD_DIR)/check_huffman_asset
+check-huffman: huffman.bin $(BUILD_DIR)/check_huffman_asset
+	python3 support/gen_huffman.py --check
 	$(BUILD_DIR)/check_huffman_asset
 
-test: $(TARGET) $(TEST_TARGETS)
+test: $(TARGET) huffman.bin $(TEST_TARGETS)
 	$(BUILD_DIR)/test_channels
 	$(BUILD_DIR)/test_scanner
 	$(BUILD_DIR)/test_tuner
