@@ -37,9 +37,9 @@ char *db_get_xmltv_programs();
 char *db_get_json_programs();
 
 /**
- * Insert or update a program entry
+ * Insert or update a program entry. Returns 1 only after commit.
  */
-void db_upsert_program(const char *frequency, const char *channel_service_id, 
+int db_upsert_program(const char *frequency, const char *channel_service_id,
                        long long start_time, long long end_time, 
                        const char *title, int event_id, int source_id);
 
@@ -74,8 +74,8 @@ typedef struct {
     int capacity;
 } ProgramList;
 
-// Batch operations
-void db_bulk_upsert(ProgramList *list);
+// Batch operations; return 1 only after the transaction commits.
+int db_bulk_upsert(ProgramList *list);
 void db_invalidate_cache();
 
 #endif /* DB_H */

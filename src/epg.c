@@ -826,7 +826,9 @@ void scan_mux(Tuner *t, unsigned long lease_generation, ScanContext *ctx,
         // Bulk upsert collected programs
         if (ctx->list.count > 0) {
             LOG_INFO("EPG", "Scan complete for %s %s: Upserting %d programs (batched)", channel_name, channel_number, ctx->list.count);
-            db_bulk_upsert(&ctx->list);
+            if (!db_bulk_upsert(&ctx->list)) {
+                LOG_ERROR("EPG", "Failed to persist guide data for %s", ctx->freq);
+            }
         } else {
             LOG_INFO("EPG", "Scan complete for %s %s: No (new) programs found", channel_name, channel_number);
         }

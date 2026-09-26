@@ -476,8 +476,8 @@ static const char *SQL_PROGRAM_UPSERT =
     "event_id=excluded.event_id, source_id=excluded.source_id;";
 
 // Bulk Upsert Implementation
-void db_bulk_upsert(ProgramList *list) {
-    if (!db || !list || !list->programs || list->count == 0) return;
+int db_bulk_upsert(ProgramList *list) {
+    if (!db || !list || !list->programs || list->count == 0) return 0;
 
     pthread_mutex_lock(&db_stmt_mutex);
     char *transaction_error = NULL;
@@ -487,7 +487,7 @@ void db_bulk_upsert(ProgramList *list) {
                   transaction_error ? transaction_error : sqlite3_errmsg(db));
         sqlite3_free(transaction_error);
         pthread_mutex_unlock(&db_stmt_mutex);
-        return;
+        return 0;
     }
     int transaction_ok = 1;
     
@@ -497,7 +497,7 @@ void db_bulk_upsert(ProgramList *list) {
             LOG_ERROR("DB", "Failed to prepare upsert stmt: %s", sqlite3_errmsg(db));
             sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
             pthread_mutex_unlock(&db_stmt_mutex);
-            return;
+            return 0;
         }
     }
 
@@ -529,16 +529,22 @@ void db_bulk_upsert(ProgramList *list) {
         transaction_ok = 0;
     }
     sqlite3_free(transaction_error);
+    if (!transaction_ok && !sqlite3_get_autocommit(db)) {
+        int rollback_rc = sqlite3_exec(db, "ROLLBACK;", NULL, NULL, NULL);
+        if (rollback_rc != SQLITE_OK) {
+            LOG_ERROR("DB", "Failed to roll back EPG transaction: %s", sqlite3_errmsg(db));
+        }
+    }
     pthread_mutex_unlock(&db_stmt_mutex);
-    
-    // Invalidate cache after update
+
     if (transaction_ok) db_invalidate_cache();
+    return transaction_ok;
 }
 
-void db_upsert_program(const char *frequency, const char *channel_service_id,
+int db_upsert_program(const char *frequency, const char *channel_service_id,
                        long long start_time, long long end_time,
                        const char *title, int event_id, int source_id) {
-    if (!db || !frequency || !channel_service_id || !title) return;
+    if (!db || !frequency || !channel_service_id || !title) return 0;
 
     Program p;
     memset(&p, 0, sizeof(p));
@@ -552,7 +558,7 @@ void db_upsert_program(const char *frequency, const char *channel_service_id,
     p.source_id = source_id;
 
     ProgramList list = { .programs = &p, .count = 1, .capacity = 1 };
-    db_bulk_upsert(&list);
+    return db_bulk_upsert(&list);
 }
 
 void db_update_program_description(const char *frequency, const char *channel_service_id, int event_id, const char *description) {

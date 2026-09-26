@@ -23,7 +23,7 @@ TARGET = $(BUILD_DIR)/zaplink
 TEST_TARGET = $(BUILD_DIR)/test_channels
 TEST_TARGETS = $(TEST_TARGET) $(BUILD_DIR)/test_tuner $(BUILD_DIR)/test_db_concurrency \
                $(BUILD_DIR)/test_stream_config $(BUILD_DIR)/test_stream_session \
-               $(BUILD_DIR)/test_transcode $(BUILD_DIR)/test_huffman
+               $(BUILD_DIR)/test_transcode $(BUILD_DIR)/test_huffman $(BUILD_DIR)/test_db_busy
 
 all: $(TARGET)
 
@@ -51,6 +51,9 @@ $(BUILD_DIR)/test_tuner: tests/test_tuner.c $(OBJ_DIR)/tuner.o
 $(BUILD_DIR)/test_db_concurrency: tests/test_db_concurrency.c $(OBJ_DIR)/db.o $(OBJ_DIR)/channels.o
 	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
+$(BUILD_DIR)/test_db_busy: tests/test_db_busy.c $(OBJ_DIR)/db.o $(OBJ_DIR)/channels.o
+	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@ $(LDFLAGS)
+
 $(BUILD_DIR)/test_stream_config: tests/test_stream_config.c $(OBJ_DIR)/stream_config.o
 	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
@@ -67,6 +70,7 @@ test: $(TARGET) $(TEST_TARGETS)
 	$(BUILD_DIR)/test_channels
 	$(BUILD_DIR)/test_tuner
 	$(BUILD_DIR)/test_db_concurrency
+	$(BUILD_DIR)/test_db_busy
 	$(BUILD_DIR)/test_stream_config
 	$(BUILD_DIR)/test_stream_session
 	$(BUILD_DIR)/test_transcode
