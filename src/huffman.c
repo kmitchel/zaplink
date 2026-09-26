@@ -38,6 +38,25 @@ static int read_exact(int fd, void *buffer, size_t length) {
     return 1;
 }
 
+static int table_has_codes(const HuffmanNode *trees, int tree_nodes) {
+    int useful_root = 0;
+    int nonempty_leaf = 0;
+    for (int context = 0; context < 128; context++) {
+        const HuffmanNode *tree = trees + (size_t)context * tree_nodes;
+        if (tree[0].children[0] != -1 || tree[0].children[1] != -1) {
+            useful_root = 1;
+        }
+        for (int node = 0; node < tree_nodes; node++) {
+            for (int bit = 0; bit < 2; bit++) {
+                int child = tree[node].children[bit];
+                if (child < -1) nonempty_leaf = 1;
+                if (child >= tree_nodes) return 0;
+            }
+        }
+    }
+    return useful_root && nonempty_leaf;
+}
+
 static int huffman_load(void) {
     int fd = open("huffman.bin", O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
@@ -103,6 +122,15 @@ static int huffman_load(void) {
         free(desc_trees);
         title_trees = NULL;
         desc_trees = NULL;
+        nodes_per_tree = 0;
+        return 0;
+    }
+    if (!table_has_codes(title_trees, nodes_per_tree) ||
+        !table_has_codes(desc_trees, nodes_per_tree)) {
+        LOG_ERROR("HUFFMAN", "huffman.bin contains placeholder or invalid decode tables");
+        free(title_trees);
+        free(desc_trees);
+        title_trees = desc_trees = NULL;
         nodes_per_tree = 0;
         return 0;
     }

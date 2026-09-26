@@ -69,6 +69,12 @@ $(BUILD_DIR)/test_transcode: tests/test_transcode.c $(OBJ_DIR)/transcode.o $(OBJ
 $(BUILD_DIR)/test_huffman: tests/test_huffman.c $(OBJ_DIR)/huffman.o
 	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
+$(BUILD_DIR)/check_huffman_asset: tests/check_huffman_asset.c $(OBJ_DIR)/huffman.o
+	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@ $(LDFLAGS)
+
+check-huffman: $(BUILD_DIR)/check_huffman_asset
+	$(BUILD_DIR)/check_huffman_asset
+
 test: $(TARGET) $(TEST_TARGETS)
 	$(BUILD_DIR)/test_channels
 	$(BUILD_DIR)/test_scanner
@@ -92,7 +98,7 @@ http-descriptor-test: $(BUILD_DIR)/zaplink_no_tuner_test
 http-contract-test: $(TARGET)
 	tests/test_http_contract.sh
 
-install: $(TARGET)
+install: $(TARGET) check-huffman
 	@echo "Installing ZapLink..."
 	@if ! id -u zaplink > /dev/null 2>&1; then \
 		useradd -r -s /usr/sbin/nologin zaplink; \
@@ -108,4 +114,4 @@ install: $(TARGET)
 	systemctl daemon-reload
 	@echo "Installed. Service enabled. Start with: systemctl start zaplink"
 
-.PHONY: all clean install test http-contract-test http-descriptor-test
+.PHONY: all clean install test http-contract-test http-descriptor-test check-huffman

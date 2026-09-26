@@ -12,6 +12,7 @@
 #include "tuner.h"
 #include "http_server.h"
 #include "epg.h"
+#include "huffman.h"
 #include "scanner.h"
 #include "transcode.h"
 #include "benchmark.h"
@@ -117,6 +118,9 @@ int main(int argc, char *argv[]) {
     
     if (!g_no_epg && epg_scan_enabled) {
         LOG_INFO("MAIN", "Starting EPG Engine...");
+        if (!huffman_init()) {
+            LOG_WARN("MAIN", "Compressed guide text is unavailable; install validated huffman.bin tables");
+        }
         start_epg_thread();
     } else if (!g_no_epg) {
         LOG_INFO("MAIN", "Periodic EPG tuner scans are disabled; use -e to enable them");
