@@ -51,11 +51,11 @@ int main(void) {
     assert(pthread_join(writers[0], NULL) == 0);
     assert(pthread_join(writers[1], NULL) == 0);
 
-    char *json = db_get_json_programs();
-    assert(json != NULL);
-    assert(strstr(json, "Writer A") != NULL);
-    assert(strstr(json, "Writer B") != NULL);
-    free(json);
+    char *xml = db_get_xmltv_programs();
+    assert(xml != NULL);
+    assert(strstr(xml, "Writer A") != NULL);
+    assert(strstr(xml, "Writer B") != NULL);
+    free(xml);
     db_close();
 
     assert(unlink("epg.db") == 0);

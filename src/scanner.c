@@ -1,15 +1,31 @@
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
-#include <sys/select.h>
 #include <ctype.h>
 #include <glob.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <signal.h>
+#include <poll.h>
+#include <spawn.h>
+#include <stdint.h>
+#include <time.h>
+#include <limits.h>
+#include "tune_config.h"
+extern char **environ;
+#ifndef SIGNAL_TIMEOUT_MS
+#define SIGNAL_TIMEOUT_MS 12000
+#endif
+#ifndef FETCH_TIMEOUT_MS
+#define FETCH_TIMEOUT_MS 20000
+#endif
+#ifndef SCAN_TIMEOUT_MS
+#define SCAN_TIMEOUT_MS (15 * 60 * 1000)
+#endif
 #include "log.h"
 #include "scanner.h"
 #include "config.h"
@@ -28,6 +44,8 @@ typedef struct {
     int overflow_warned; // Track if we've warned about overflow
     int wait_status;
     int status_valid;
+    int finished;
+    int discard_line;
 } ScanWorker;
 
 typedef struct {
@@ -133,52 +151,140 @@ static void parse_signal_sample(ScanMultiplex *multiplex, const char *line) {
     multiplex->has_lock = 1;
 }
 
+static int64_t signal_now_ms(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+}
+
+/* All scanner children have their own process group and inherit only stdio. */
+static int spawn_scanner_child(char *const args[], int output_fd, pid_t *pid) {
+    posix_spawn_file_actions_t actions;
+    posix_spawnattr_t attr;
+    int error = posix_spawn_file_actions_init(&actions);
+    int actions_ready = error == 0, attr_ready = 0;
+    if (!error && output_fd >= 0)
+        error = posix_spawn_file_actions_adddup2(&actions, output_fd, STDOUT_FILENO);
+    if (!error && output_fd >= 0)
+        error = posix_spawn_file_actions_adddup2(&actions, output_fd, STDERR_FILENO);
+    if (!error) error = posix_spawn_file_actions_addclosefrom_np(&actions, 3);
+    if (!error) { error = posix_spawnattr_init(&attr); attr_ready = error == 0; }
+    if (!error) error = posix_spawnattr_setpgroup(&attr, 0);
+    if (!error) error = posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP);
+    if (!error) error = posix_spawnp(pid, args[0], &actions, &attr, args, environ);
+    if (actions_ready) posix_spawn_file_actions_destroy(&actions);
+    if (attr_ready) posix_spawnattr_destroy(&attr);
+    return error;
+}
+
+static void stop_scanner_child(pid_t pid, int *status) {
+    kill(-pid, SIGTERM);
+    struct timespec grace = {.tv_nsec = 250000000};
+    while (nanosleep(&grace, &grace) < 0 && errno == EINTR) {}
+    /* Also stop descendants if the direct child has already exited. */
+    kill(-pid, SIGKILL);
+    while (waitpid(pid, status, 0) < 0 && errno == EINTR) {}
+}
+
+static int wait_scanner_child(pid_t pid, int64_t deadline, int *status) {
+    for (;;) {
+        pid_t result = waitpid(pid, status, WNOHANG);
+        if (result == pid) return 1;
+        if (result < 0 && errno != EINTR) return 0;
+        if (signal_now_ms() >= deadline) return 0;
+        struct timespec pause = {.tv_nsec = 10000000};
+        nanosleep(&pause, NULL);
+    }
+}
+
+static int discover_scan_adapters(const char *pattern, int adapter_ids[], int capacity) {
+    glob_t devices;
+    if (glob(pattern, 0, NULL, &devices) != 0) return 0;
+    int count = 0;
+    for (size_t n = 0; n < devices.gl_pathc && count < capacity; n++) {
+        const char *name = strrchr(devices.gl_pathv[n], '/');
+        if (!name || strncmp(name + 1, "adapter", 7)) continue;
+        const char *digits = name + 8;
+        if (!*digits) continue;
+        const char *end = digits;
+        while (isdigit((unsigned char)*end)) end++;
+        if (*end) continue;
+        errno = 0;
+        long id = strtol(digits, NULL, 10);
+        struct stat info;
+        if (errno || id > INT_MAX || stat(devices.gl_pathv[n], &info) || !S_ISDIR(info.st_mode)) continue;
+        int duplicate = 0;
+        for (int i = 0; i < count; i++) if (adapter_ids[i] == id) duplicate = 1;
+        if (!duplicate) adapter_ids[count++] = (int)id;
+    }
+    globfree(&devices);
+    return count;
+}
+
 static int measure_multiplex(const char *config_path, int adapter,
                              ScanMultiplex *multiplex) {
+    multiplex->weak = 1;
+    multiplex->has_lock = multiplex->sample_count = 0;
+    multiplex->signal_dbm = multiplex->cnr_db = 0;
+    char tune_path[64];
+    if (!tune_config_create(config_path, multiplex->frequency, NULL,
+                            tune_path, sizeof(tune_path))) return 0;
     int pipefd[2];
-    if (pipe(pipefd) < 0) return 0;
-
-    pid_t pid = fork();
-    if (pid == 0) {
-        close(pipefd[0]);
-        dup2(pipefd[1], STDOUT_FILENO);
-        dup2(pipefd[1], STDERR_FILENO);
-        close(pipefd[1]);
-
-        char adapter_arg[16];
-        snprintf(adapter_arg, sizeof(adapter_arg), "%d", adapter);
-        execlp("dvbv5-zap", "dvbv5-zap",
-               "-a", adapter_arg, "-c", config_path, "-x", "-v",
-               multiplex->channel_name, NULL);
-        _exit(127);
-    }
-
-    if (pid < 0) {
-        close(pipefd[0]);
-        close(pipefd[1]);
-        return 0;
-    }
-
+    if (pipe2(pipefd, O_CLOEXEC) < 0) { unlink(tune_path); return 0; }
+    char adapter_arg[16];
+    snprintf(adapter_arg, sizeof(adapter_arg), "%d", adapter);
+    char *args[] = {"dvbv5-zap", "-a", adapter_arg, "-c", tune_path,
+                    "-x", "-v", "-t", "10", TUNE_SECTION, NULL};
+    pid_t pid = -1;
+    int error = spawn_scanner_child(args, pipefd[1], &pid);
     close(pipefd[1]);
-    FILE *output = fdopen(pipefd[0], "r");
-    if (output) {
-        char line[512];
-        while (fgets(line, sizeof(line), output)) {
-            parse_signal_sample(multiplex, line);
+    if (error) { close(pipefd[0]); unlink(tune_path); return 0; }
+    int flags = fcntl(pipefd[0], F_GETFL);
+    int failed = flags < 0 || fcntl(pipefd[0], F_SETFL, flags | O_NONBLOCK) < 0;
+    int64_t deadline = signal_now_ms() + SIGNAL_TIMEOUT_MS;
+    char line[512];
+    size_t used = 0;
+    int eof = 0, done = 0, status = 0;
+    while (!failed && (!eof || !done)) {
+        int remaining = (int)(deadline - signal_now_ms());
+        if (remaining <= 0) { failed = 1; break; }
+        struct pollfd fd = {.fd = eof ? -1 : pipefd[0], .events = POLLIN};
+        int result = poll(&fd, 1, remaining > 50 ? 50 : remaining);
+        if (result < 0 && errno != EINTR) { failed = 1; break; }
+        if (result > 0) {
+            char data[1024];
+            ssize_t n = read(pipefd[0], data, sizeof(data));
+            if (!n) eof = 1;
+            else if (n < 0 && errno != EAGAIN && errno != EINTR) failed = 1;
+            for (ssize_t i = 0; i < n; i++) {
+                if (data[i] == '\n' || used == sizeof(line) - 1) {
+                    line[used] = 0;
+                    parse_signal_sample(multiplex, line);
+                    used = 0;
+                }
+                if (data[i] != '\n') line[used++] = data[i];
+            }
         }
-        fclose(output);
-    } else {
-        close(pipefd[0]);
+        if (!done) {
+            pid_t result = waitpid(pid, &status, WNOHANG);
+            if (result == pid) done = 1;
+            else if (result < 0 && errno != EINTR) { failed = 1; done = 1; }
+        }
     }
-
-    int status;
-    waitpid(pid, &status, 0);
+    if (used) { line[used] = 0; parse_signal_sample(multiplex, line); }
+    if (failed) {
+        stop_scanner_child(pid, &status);
+        done = 1;
+    }
+    if (!done) while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+    close(pipefd[0]);
+    unlink(tune_path);
     if (multiplex->sample_count > 0) {
         multiplex->signal_dbm /= multiplex->sample_count;
         multiplex->cnr_db /= multiplex->sample_count;
     }
-    multiplex->weak = !multiplex->has_lock ||
-                      multiplex->cnr_db < MIN_RELIABLE_CNR_DB;
+    if (failed || !WIFEXITED(status) || WEXITSTATUS(status) != 0) multiplex->has_lock = 0;
+    multiplex->weak = !multiplex->has_lock || multiplex->cnr_db < MIN_RELIABLE_CNR_DB;
     return multiplex->has_lock;
 }
 
@@ -261,11 +367,19 @@ int scanner_validate_signals(const char *config_path, int adapter,
         return -1;
     }
 
+    int adapter_ids[MAX_ADAPTERS], adapter_count = 0;
+    if (adapter >= 0) adapter_ids[adapter_count++] = adapter;
+    else adapter_count = discover_scan_adapters("/dev/dvb/adapter*", adapter_ids, MAX_ADAPTERS);
+    if (!adapter_count) return -1;
+
     printf("\n[SCANNER] Validating %d multiplexes (minimum %.1f dB C/N)...\n",
            mux_count, MIN_RELIABLE_CNR_DB);
     int weak_count = 0;
     for (int i = 0; i < mux_count; i++) {
-        measure_multiplex(config_path, adapter, &multiplexes[i]);
+        multiplexes[i].weak = 1;
+        for (int n = 0; n < adapter_count; n++) {
+            if (measure_multiplex(config_path, adapter_ids[n], &multiplexes[i])) break;
+        }
         if (multiplexes[i].weak) weak_count++;
 
         double mhz = strtod(multiplexes[i].frequency, NULL) / 1000000.0;
@@ -307,21 +421,6 @@ static int get_center_freq(int channel) {
     return 0;
 }
 
-static int get_adapter_count() {
-    glob_t g;
-    if (glob("/dev/dvb/adapter*", 0, NULL, &g) != 0) {
-        return 0;
-    }
-    int count = (int)g.gl_pathc;
-    globfree(&g);
-    if (count > MAX_ADAPTERS) {
-        printf("[SCANNER] Detected %d adapters; using the first %d.\n",
-               count, MAX_ADAPTERS);
-        count = MAX_ADAPTERS;
-    }
-    return count;
-}
-
 static int fetch_and_process(const char *zip, const char *scan_file,
                              const char *tmp_html, int skip_vhf) {
     char url[256];
@@ -329,19 +428,19 @@ static int fetch_and_process(const char *zip, const char *scan_file,
     
     printf("[SCANNER] Querying RabbitEars for %s...%s\n", zip, skip_vhf ? " (skipping VHF)" : "");
     
-    /* Use fork/exec instead of system() to avoid command injection risk */
-    pid_t pid = fork();
-    if (pid == 0) {
-        /* Child process */
-        execlp("curl", "curl", "-s", "-o", tmp_html, url, NULL);
-        _exit(1);
-    } else if (pid > 0) {
-        /* Parent: wait for curl to complete */
-        int status;
-        waitpid(pid, &status, 0);
-    }
-    
-    FILE *f = fopen(tmp_html, "r");
+    unlink(tmp_html);
+    char *args[] = {"curl", "--fail", "--silent", "--show-error",
+        "--connect-timeout", "5", "--max-time", "15", "-o", (char *)tmp_html, url, NULL};
+    pid_t pid = -1;
+    int status = 0;
+    int error = spawn_scanner_child(args, -1, &pid);
+    int finished = !error && wait_scanner_child(pid, signal_now_ms() + FETCH_TIMEOUT_MS, &status);
+    if (!error && !finished) stop_scanner_child(pid, &status);
+    int fetched = finished && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    /* Never parse a partial response from a failed or timed-out transfer. */
+    FILE *f = fetched ? fopen(tmp_html, "r") : NULL;
+    if (!fetched) unlink(tmp_html);
+
     if (!f) {
         printf("[SCANNER] Failed to fetch data. Falling back to full scan.\n");
         f = NULL;
@@ -406,7 +505,7 @@ static int split_scan_list(const char *scan_file, int parts,
     FILE *in = fopen(scan_file, "r");
     if (!in) return 0;
     
-    FILE *outs[MAX_ADAPTERS];
+    FILE *outs[MAX_ADAPTERS] = {0};
     for (int i = 0; i < parts; i++) {
         snprintf(part_files[i], 128, "%s.part%d", scan_file, i);
         outs[i] = fopen(part_files[i], "w");
@@ -443,7 +542,7 @@ static void parse_output_line(int tuner_id, char *line) {
     // "Virtual channel 55.1, name = WFFT-TV"
     // "Lock   (0x1f) Signal= -39.00dBm C/N= 32.77dB"
     
-    // Simple sanitization of ANSI codes could be complex, assuming raw text for now or simple skip
+    // Station labels are taken from verbose scanner output.
     // dvbv5-scan -v output is verbose
     
     char *lock = strstr(line, "Lock");
@@ -500,181 +599,109 @@ static int config_has_valid_service(const char *path) {
     return valid;
 }
 
-static int run_parallel_scan(int num_adapters, char part_files[][128],
-                             const char *dest_file) {
-    ScanWorker workers[MAX_ADAPTERS];
-    memset(workers, 0, sizeof(workers));
-    int active_workers = 0;
-    int worker_failed = 0;
-    
-    printf("\n[SCANNER] Starting parallel scan on %d tuners...\n", num_adapters);
-    
-    for (int i = 0; i < num_adapters; i++) {
-        int pipefd[2];
-        if (pipe(pipefd) < 0) {
-            perror("pipe");
-            worker_failed = 1;
-            continue;
-        }
-        
-        pid_t pid = fork();
-        if (pid == 0) {
-            // Child
-            close(pipefd[0]);
-            dup2(pipefd[1], STDERR_FILENO);
-            dup2(pipefd[1], STDOUT_FILENO);
-            close(pipefd[1]);
-            
-            char out_part[128];
-            snprintf(out_part, sizeof(out_part), "%s.out", part_files[i]);
-            
-            char adapter_arg[16];
-            snprintf(adapter_arg, sizeof(adapter_arg), "%d", i);
-            
-            // exec dvbv5-scan
-            // dvbv5-scan -a <i> -F -T 0.5 -v -C us -o <out_part> <part_file>
-            execlp("dvbv5-scan", "dvbv5-scan", 
-                   "-a", adapter_arg,
-                   "-F", "-T", "0.5", "-v", "-C", "us",
-                   "-o", out_part,
-                   part_files[i], NULL);
-            exit(1);
-        } else if (pid > 0) {
-            // Parent
-            close(pipefd[1]);
-            workers[i].id = i;
-            workers[i].pid = pid;
-            workers[i].pipe_fd = pipefd[0];
-            workers[i].buf_len = 0;
-            workers[i].overflow_warned = 0;
-            active_workers++;
-        } else {
-            close(pipefd[0]);
-            close(pipefd[1]);
-            LOG_ERROR("SCANNER", "Unable to fork scanner for adapter %d", i);
-            worker_failed = 1;
-        }
-    }
-    
-    // Read loop
-    while (active_workers > 0) {
-        fd_set fds;
-        FD_ZERO(&fds);
-        int max_fd = 0;
-        
-        for (int i = 0; i < num_adapters; i++) {
-            if (workers[i].pid > 0) {
-                FD_SET(workers[i].pipe_fd, &fds);
-                if (workers[i].pipe_fd > max_fd) max_fd = workers[i].pipe_fd;
+static void consume_scan_output(ScanWorker *worker, const char *data, size_t length) {
+    for (size_t n = 0; n < length; n++) {
+        if (data[n] == '\n') {
+            if (!worker->discard_line) {
+                worker->buffer[worker->buf_len] = 0;
+                parse_output_line(worker->id, worker->buffer);
             }
-        }
-        
-        struct timeval tv = {1, 0}; // 1 sec timeout
-        int ret = select(max_fd + 1, &fds, NULL, NULL, &tv);
-        
-        if (ret > 0) {
-            for (int i = 0; i < num_adapters; i++) {
-                if (workers[i].pid > 0 && FD_ISSET(workers[i].pipe_fd, &fds)) {
-                    char buf[256];
-                    ssize_t n = read(workers[i].pipe_fd, buf, sizeof(buf) - 1);
-                    if (n > 0) {
-                        buf[n] = 0;
-                        /* Buffer chunk data and process complete newline-delimited lines */
-                        // Append to worker buffer
-                        if (workers[i].buf_len + n < (int)sizeof(workers[i].buffer) - 1) {
-                            memcpy(workers[i].buffer + workers[i].buf_len, buf, n);
-                            workers[i].buf_len += n;
-                            workers[i].buffer[workers[i].buf_len] = 0;
-                        } else {
-                            // Buffer overflow: discard partial line and reset
-                            if (!workers[i].overflow_warned) {
-                                printf(" [WARN] [Tuner %d] Buffer overflow, some output may be missed\n", i);
-                                workers[i].overflow_warned = 1;
-                            }
-                            // Find last newline and keep only what's after it
-                            char *last_nl = strrchr(workers[i].buffer, '\n');
-                            if (last_nl) {
-                                int keep = workers[i].buf_len - (last_nl + 1 - workers[i].buffer);
-                                memmove(workers[i].buffer, last_nl + 1, keep);
-                                workers[i].buf_len = keep;
-                            } else {
-                                // No newline, discard everything
-                                workers[i].buf_len = 0;
-                            }
-                            workers[i].buffer[workers[i].buf_len] = 0;
-                            // Now append new data if it fits
-                            if (workers[i].buf_len + n < (int)sizeof(workers[i].buffer) - 1) {
-                                memcpy(workers[i].buffer + workers[i].buf_len, buf, n);
-                                workers[i].buf_len += n;
-                                workers[i].buffer[workers[i].buf_len] = 0;
-                            }
-                        }
-                        
-                        // Process complete lines
-                        char *start = workers[i].buffer;
-                        char *newline;
-                        while ((newline = strchr(start, '\n'))) {
-                            *newline = 0;
-                            parse_output_line(i, start);
-                            start = newline + 1;
-                        }
-                        
-                        // Move remaining partial line to beginning
-                        int remaining = workers[i].buf_len - (start - workers[i].buffer);
-                        if (remaining > 0 && start != workers[i].buffer) {
-                            memmove(workers[i].buffer, start, remaining);
-                        }
-                        workers[i].buf_len = remaining;
-                        workers[i].buffer[remaining] = 0;
-                        
-                    } else {
-                        // EOF
-                        close(workers[i].pipe_fd);
-                        workers[i].status_valid =
-                            waitpid(workers[i].pid, &workers[i].wait_status, 0) > 0;
-                        workers[i].pid = 0; // Mark done
-                        active_workers--;
-                    }
+            worker->buf_len = worker->discard_line = 0;
+        } else if (!worker->discard_line) {
+            if (worker->buf_len + 1 < (int)sizeof(worker->buffer))
+                worker->buffer[worker->buf_len++] = data[n];
+            else {
+                worker->discard_line = 1;
+                if (!worker->overflow_warned) {
+                    LOG_WARN("SCANNER", "Adapter %d output line is too long", worker->id);
+                    worker->overflow_warned = 1;
                 }
             }
-        } 
-        else if (ret == 0) {
-            /* Check if any worker processes exited during the timeout window */
-            for (int i = 0; i < num_adapters; i++) {
-                 if (workers[i].pid > 0) {
-                    int status;
-                    if (waitpid(workers[i].pid, &status, WNOHANG) > 0) {
-                         workers[i].wait_status = status;
-                         workers[i].status_valid = 1;
-                         close(workers[i].pipe_fd);
-                         workers[i].pid = 0;
-                         active_workers--;
-                    }
-                 }
+        }
+    }
+}
+
+static int run_parallel_scan(const int adapter_ids[], int num_adapters,
+                             char part_files[][128], const char *dest_file) {
+    if (num_adapters <= 0 || num_adapters > MAX_ADAPTERS) return 0;
+    ScanWorker workers[MAX_ADAPTERS] = {0};
+    int active_workers = 0, worker_failed = 0;
+    int64_t deadline = signal_now_ms() + SCAN_TIMEOUT_MS;
+    for (int i = 0; i < num_adapters; i++) workers[i].pipe_fd = -1;
+    printf("\n[SCANNER] Starting parallel scan on %d tuners...\n", num_adapters);
+
+    for (int i = 0; i < num_adapters; i++) {
+        int pipefd[2];
+        if (pipe2(pipefd, O_CLOEXEC | O_NONBLOCK) < 0) { worker_failed = 1; break; }
+        /* The child should have blocking output; only the parent read end is nonblocking. */
+        int flags = fcntl(pipefd[1], F_GETFL);
+        if (flags < 0 || fcntl(pipefd[1], F_SETFL, flags & ~O_NONBLOCK) < 0) {
+            close(pipefd[0]); close(pipefd[1]); worker_failed = 1; break;
+        }
+        char out_part[160], adapter_arg[16];
+        snprintf(out_part, sizeof(out_part), "%s.out", part_files[i]);
+        snprintf(adapter_arg, sizeof(adapter_arg), "%d", adapter_ids[i]);
+        char *args[] = {"dvbv5-scan", "-a", adapter_arg, "-F", "-T", "0.5",
+                       "-v", "-C", "us", "-o", out_part, part_files[i], NULL};
+        workers[i].id = adapter_ids[i];
+        int error = spawn_scanner_child(args, pipefd[1], &workers[i].pid);
+        close(pipefd[1]);
+        if (error) {
+            close(pipefd[0]);
+            LOG_ERROR("SCANNER", "Unable to start scanner for adapter %d: %s", adapter_ids[i], strerror(error));
+            worker_failed = 1; break;
+        }
+        workers[i].pipe_fd = pipefd[0];
+        active_workers++;
+    }
+
+    while (active_workers && !worker_failed) {
+        int64_t remaining = deadline - signal_now_ms();
+        if (remaining <= 0) {
+            LOG_ERROR("SCANNER", "Channel scan deadline exceeded");
+            worker_failed = 1; break;
+        }
+        struct pollfd descriptors[MAX_ADAPTERS];
+        for (int i = 0; i < num_adapters; i++)
+            descriptors[i] = (struct pollfd){.fd = workers[i].pipe_fd, .events = POLLIN};
+        int result = poll(descriptors, num_adapters, remaining > 50 ? 50 : (int)remaining);
+        if (result < 0 && errno != EINTR) {
+            LOG_ERROR("SCANNER", "Worker poll failed: %s", strerror(errno));
+            worker_failed = 1; break;
+        }
+        for (int i = 0; i < num_adapters; i++) {
+            ScanWorker *worker = &workers[i];
+            if (worker->pid <= 0 || worker->finished) continue;
+            if (result > 0 && descriptors[i].revents) {
+                char data[1024];
+                ssize_t n = read(worker->pipe_fd, data, sizeof(data));
+                if (n > 0) consume_scan_output(worker, data, (size_t)n);
+                else if (n == 0) {
+                    if (worker->buf_len && !worker->discard_line) consume_scan_output(worker, "\n", 1);
+                    close(worker->pipe_fd); worker->pipe_fd = -1;
+                } else if (errno != EAGAIN && errno != EINTR) worker_failed = 1;
             }
-        } else if (ret < 0 && errno != EINTR) {
-            LOG_ERROR("SCANNER", "select failed: %s", strerror(errno));
-            break;
+            if (!worker->status_valid) {
+                pid_t waited = waitpid(worker->pid, &worker->wait_status, WNOHANG);
+                if (waited == worker->pid) worker->status_valid = 1;
+                else if (waited < 0 && errno != EINTR) worker_failed = 1;
+            }
+            if (worker->status_valid) {
+                if (!WIFEXITED(worker->wait_status) || WEXITSTATUS(worker->wait_status)) {
+                    LOG_WARN("SCANNER", "Worker on adapter %d exited unsuccessfully (status=%d)", worker->id, worker->wait_status);
+                    worker_failed = 1;
+                }
+                if (worker->pipe_fd < 0) { worker->finished = 1; active_workers--; }
+            }
         }
     }
 
     for (int i = 0; i < num_adapters; i++) {
-        if (workers[i].pid > 0) {
-            kill(workers[i].pid, SIGTERM);
-            workers[i].status_valid =
-                waitpid(workers[i].pid, &workers[i].wait_status, 0) > 0;
-            close(workers[i].pipe_fd);
-            workers[i].pid = 0;
-        }
-        if (workers[i].status_valid &&
-            (!WIFEXITED(workers[i].wait_status) ||
-             WEXITSTATUS(workers[i].wait_status) != 0)) {
-            LOG_WARN("SCANNER", "Scan worker %d exited unsuccessfully", i);
-            worker_failed = 1;
-        } else if (!workers[i].status_valid) {
-            LOG_WARN("SCANNER", "Scan worker %d did not finish", i);
+        if (workers[i].pid > 0 && !workers[i].finished) {
+            stop_scanner_child(workers[i].pid, &workers[i].wait_status);
             worker_failed = 1;
         }
+        if (workers[i].pipe_fd >= 0) close(workers[i].pipe_fd);
     }
 
     if (worker_failed) {
@@ -753,7 +780,8 @@ int scanner_check(const char *config_path, int force_scan) {
     printf("        ZapLink Setup @ %s\n", config_path);
     printf("============================================\n");
     
-    int adapters = get_adapter_count();
+    int adapter_ids[MAX_ADAPTERS];
+    int adapters = discover_scan_adapters("/dev/dvb/adapter*", adapter_ids, MAX_ADAPTERS);
     printf("Detected %d tuners.\n", adapters);
     if (adapters == 0) {
         printf("Error: No DVB adapters found in /dev/dvb/.\n");
@@ -857,7 +885,7 @@ int scanner_check(const char *config_path, int force_scan) {
     }
     close(candidate_fd);
 
-    int scan_ok = run_parallel_scan(adapters, part_files, candidate_path);
+    int scan_ok = run_parallel_scan(adapter_ids, adapters, part_files, candidate_path);
     unlink(scan_html);
     rmdir(temp_directory);
     if (!scan_ok) {
@@ -866,7 +894,7 @@ int scanner_check(const char *config_path, int force_scan) {
         return -1;
     }
 
-    if (scanner_validate_signals(candidate_path, 0, include_weak) < 0) {
+    if (scanner_validate_signals(candidate_path, -1, include_weak) < 0) {
         unlink(candidate_path);
         LOG_ERROR("SCANNER", "Signal validation failed; existing configuration was preserved");
         return -1;

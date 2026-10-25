@@ -21,7 +21,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <errno.h>
+#include <limits.h>
+#include "log.h"
 #include "channels.h"
+#include "service_id.h"
 #include "config.h"
 
 /* Global channel storage */
@@ -86,6 +90,39 @@ static int compare_channels(const void *a, const void *b) {
     return strcmp(cha->service_id, chb->service_id);
 }
 
+static int valid_channel(const Channel *channel, unsigned int *service) {
+    const char *number = channel->number;
+    if (!isdigit((unsigned char)*number)) return 0;
+    errno = 0; char *number_end;
+    unsigned long major = strtoul(number, &number_end, 10);
+    if (errno || major > INT_MAX) return 0;
+    if (*number_end == '.') {
+        number = number_end + 1;
+        if (!isdigit((unsigned char)*number)) return 0;
+        errno = 0;
+        unsigned long minor = strtoul(number, &number_end, 10);
+        if (errno || minor > INT_MAX) return 0;
+    }
+    if (*number_end) return 0;
+    const char *frequency = channel->frequency;
+    if (!*frequency) return 0;
+    for (const char *p = frequency; *p; p++) if (*p < '0' || *p > '9') return 0;
+    errno = 0;
+    unsigned long hz = strtoul(frequency, NULL, 10);
+    if (errno || !hz || hz > UINT_MAX) return 0;
+    return parse_service_id(channel->service_id, service);
+}
+
+static void finish_channel(Channel *current) {
+    if (!current) return;
+    unsigned int service;
+    if (valid_channel(current, &service)) {
+        snprintf(current->service_id, sizeof(current->service_id), "%u", service);
+        channel_count++;
+    }
+    else LOG_WARN("CHANNELS", "Ignoring station with invalid virtual channel, frequency or service: %s", current->name);
+}
+
 int load_channels(const char *filename) {
     FILE *f = fopen(filename, "r");
     if (!f) return -1;
@@ -107,9 +144,7 @@ int load_channels(const char *filename) {
         // Check for section header [ChannelName]
         if (line[0] == '[' && len > 2 && line[len-1] == ']') {
             // Save previous channel if valid
-            if (current && current->frequency[0] != '\0' && channel_count < MAX_CHANNELS) {
-                channel_count++;
-            }
+            finish_channel(current);
             if (channel_count >= MAX_CHANNELS) break;
             
             // Start new channel
@@ -142,9 +177,7 @@ int load_channels(const char *filename) {
         }
     }
     
-    if (current && current->frequency[0] != '\0' && channel_count < MAX_CHANNELS) {
-        channel_count++;
-    }
+    if (channel_count < MAX_CHANNELS) finish_channel(current);
 
     if (channel_count > 1) {
         qsort(channels, channel_count, sizeof(Channel), compare_channels);
@@ -216,10 +249,8 @@ Channel *find_channel_by_freq_sid(const char *freq, int service_id) {
     
     for (int i = 0; i < channel_count; i++) {
         if (strcmp(channels[i].frequency, freq) != 0) continue;
-        /* Numeric comparison handles decimal, hex (0x), and octal (0) prefixes */
-        char *endptr = NULL;
-        long stored_sid = strtol(channels[i].service_id, &endptr, 0);
-        if (endptr && *endptr == '\0' && stored_sid == (long)service_id) {
+        unsigned int stored_sid;
+        if (parse_service_id(channels[i].service_id, &stored_sid) && stored_sid == (unsigned int)service_id) {
             return &channels[i];
         }
     }

@@ -4,7 +4,7 @@ build/
 zaplink
 
 # Local configuration and data
-channels.conf
+/channels.conf
 epg.db
 huffman.bin
 

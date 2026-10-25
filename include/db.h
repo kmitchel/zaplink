@@ -31,12 +31,6 @@ int db_has_data();
 char *db_get_xmltv_programs();
 
 /**
- * Generate JSON-formatted program guide
- * @return Allocated JSON string (caller must free), or NULL on error
- */
-char *db_get_json_programs();
-
-/**
  * Insert or update a program entry. Returns 1 only after commit.
  */
 int db_upsert_program(const char *frequency, const char *channel_service_id,
@@ -52,7 +46,6 @@ void db_update_program_description(const char *frequency,
 
 /**
  * Delete program entries that ended more than 48 hours ago
- * (Retains history needed for recurring series detection)
  * @return Number of entries deleted
  */
 int db_cleanup_expired();

@@ -1,10 +1,10 @@
 # ZapLink
 
-ZapLink is a lightweight ATSC/DVB backend that scans channels, builds an EPG from PSIP tables, and serves live streams and guide data over HTTP for clients like Jellyfin.
+ZapLink is a lightweight ATSC backend that scans channels, builds an EPG from PSIP tables, and serves live streams and guide data over HTTP for clients like Jellyfin.
 
 ## Security Features
 
-ZapLink has been hardened for production environments:
+ZapLink includes the following safeguards. Use its unauthenticated HTTP endpoints only on a trusted network:
 
 -   **Shell Removal**: The transcoding pipeline uses `posix_spawnp()` with explicit file actions and argument arrays, avoiding both shell injection and unsafe post-`fork()` setup in the multithreaded server.
 -   **Argument Safety**: FFmpeg argument construction has a fixed 128-entry limit and refuses to launch a partial command if that limit is exceeded.
@@ -15,8 +15,8 @@ ZapLink has been hardened for production environments:
 - **Automatic Channel Scan**: Parallel tuner scanning with RabbitEars zip-code hints and optional VHF skipping.
 - **Reliable Device Startup**: Waits up to 30 seconds for USB DVB frontends before scanning or serving streams.
 - **Weak-Signal Filtering**: Measures each scanned multiplex and comments out channels below 20 dB C/N unless explicitly retained.
-- **Robust EPG**: Low-overhead background EPG collection with valid XMLTV output supporting Jellyfin Series Recording and bounded memory footprint.
-- **Stable Channel Identity**: Precomputed collision-free identifiers keep playlist, XMLTV, and stream routing consistent.
+- **Robust EPG**: Background ATSC PSIP collection with XMLTV output, up to 8,192 programs and 2,048 pending descriptions per multiplex scan.
+- **Stable Channel Identity**: Precomputed identifiers distinguish duplicate virtual channel numbers. Streaming, guide scans and signal validation tune through a private configuration for the selected frequency and service.
 - **Live Streaming**: Supports software and hardware transcoding (QSV, VAAPI, NVENC) via FFmpeg.
 - **Fast Stream Handoffs**: Compatible MPEG-TS requests share one normalized producer and remain warm briefly across probe-to-playback reconnects.
 - **Simple API**: HTTP endpoints for M3U playlists and XMLTV guide data.
@@ -28,7 +28,7 @@ ZapLink has been hardened for production environments:
 - `ffmpeg` (for streaming/transcoding).
 - SQLite3 (development headers).
 - `curl` (for scan hints).
-- `make` and `gcc`.
+- `make`, `gcc`, and Python 3 (Huffman table generation and verification).
 
 ## Build & Install
 
@@ -417,9 +417,63 @@ Rollback artifacts should remain `root:root` and mode `0755` for binaries or
 `0644` for units.
 
 ## Notes
-- **Series Recording**: The generated XMLTV includes special tags (`<episode-num>`, `<category>Series</category>`) to ensure Jellyfin recognizes recurring shows.
+- **Guide metadata**: XMLTV includes broadcast titles, descriptions and airing times. It omits episode numbers, new-airing flags and series categories because these are not established by the collected data.
 - **VHF Skipping**: During scan, you can choose to skip VHF-LO/HI (RF 2-13) if you only have a UHF antenna.
 - **Weak Channels**: The scanner asks whether to retain multiplexes below 20 dB C/N. By default their complete configuration blocks are preserved as comments so they are visible for later review but unavailable to Jellyfin.
 
+## Reliability verification
+
+`make test` uses committed fixtures and fake tuner/media commands; it requires no
+local `channels.conf` or DVB hardware. Run it from a fresh checkout. The suite
+covers duplicate-VCN tuning, scanner deadlines and launch failures, EPG ordering
+and memory limits, XMLTV metadata, database lock recovery and HTTP contracts.
+These checks do not establish reception quality or hardware transcoder support.
+Signal validation allows 10 seconds in dvbv5-zap and enforces a 12-second parent
+deadline with process-group termination. Failed measurements are weak signals.
+RabbitEars requests have a 5-second connection timeout, a 15-second curl timeout,
+and a 20-second parent deadline; failed responses fall back to the full RF list.
+Parallel channel scans have a 15-minute overall deadline. Timed-out child process
+groups receive SIGTERM and, after 250 ms, SIGKILL. Failed scans preserve the active
+configuration. Scanner workers use discovered adapter IDs, including sparse IDs.
+Manual configurations must use numeric virtual channel numbers (major or
+major.minor), decimal frequencies, and service IDs in the range 1-65535.
+Service IDs are decimal even with leading zeroes (`08` means 8, `010` means 10);
+an explicit `0x` prefix selects hexadecimal. Loaded IDs and the private tuning
+configuration use canonical decimal service IDs. Frequency-qualified public IDs
+can change for padded or hexadecimal service IDs; refresh client playlists when
+upgrading those configurations.
+Invalid stations are skipped with a warning. Playlist Host authorities are
+validated as hostnames/IPv4 (including underscore service names) or bracketed
+IPv6 with an optional numeric port. In scoped addresses, `%25` always denotes
+the encoded delimiter; it is never guessed to be part of a raw scope number.
+Numeric scopes must use encoded form. Raw nonnumeric interface names such as
+`%eth0` remain accepted and are encoded as `%25eth0` in playlist URLs.
+An interface literally named `25eth0` must use `%2525eth0`; `%25eth0`
+means the encoded interface name `eth0`.
+
+| Host address | Meaning |
+| --- | --- |
+| `[fe80::1%2525]` | Numeric scope 25 |
+| `[fe80::1%25250]` | Numeric scope 250 |
+| `[fe80::1%250]` | Numeric scope 0, not raw scope 250 |
+| `[fe80::1%25]` | Rejected: empty encoded scope |
+| `[fe80::1%2]` | Rejected: raw numeric scope; use `%252` |
+
+
+Normal EPG scans pass `-t 45` to dvbv5-zap and enforce a separate 50-second
+monotonic parent deadline covering both pipe reads and child completion.
+Timed-out process groups receive TERM/KILL cleanup and retry on the next scan
+cycle. Signal-killed children also wait for the next cycle; only tuner preemption
+requeues a multiplex immediately. Valid programs collected before a failure can
+still be saved.
+The packaged service is skipped when `/var/lib/zaplink/channels.conf` is absent;
+install the configuration before starting it.
+
 ## License
-No license specified.
+
+ZapLink's original code and documentation are licensed under the
+[MIT License](LICENSE), copyright (c) 2026 Kenneth Mitchell.
+SPDX license identifier: `MIT`.
+
+ATSC Huffman table data and third-party dependencies retain their separate
+terms; see [Third-party notices](THIRD_PARTY_NOTICES.md).

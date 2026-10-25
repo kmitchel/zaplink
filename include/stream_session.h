@@ -38,6 +38,7 @@ ssize_t stream_session_read(StreamSession *session,
                             int timeout_ms);
 
 void stream_session_release(StreamSession *session);
+/* Thread-local snapshot; valid until the next error query on this thread. */
 const char *stream_session_error(StreamSession *session);
 size_t stream_sessions_active_count(void);
 void stream_sessions_shutdown(void);

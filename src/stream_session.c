@@ -44,6 +44,7 @@ static pthread_once_t sessions_once = PTHREAD_ONCE_INIT;
 static StreamProducerOps producer_ops;
 static size_t active_producers;
 static int initialized;
+static int slots_ready;
 static int shutting_down;
 
 static int64_t monotonic_milliseconds(void) {
@@ -53,9 +54,29 @@ static int64_t monotonic_milliseconds(void) {
 }
 
 static void initialize_slots(void) {
-    for (size_t i = 0; i < MAX_STREAM_SESSIONS; i++) {
-        pthread_cond_init(&sessions[i].data_ready, NULL);
+    pthread_condattr_t attr;
+    int error = pthread_condattr_init(&attr);
+    if (error) {
+        LOG_ERROR("SESSION", "Unable to initialize condition attributes: %s", strerror(error));
+        return;
     }
+    error = pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+    size_t count = 0;
+    while (!error && count < MAX_STREAM_SESSIONS) {
+        error = pthread_cond_init(&sessions[count].data_ready, &attr);
+        if (!error) count++;
+    }
+    int destroy_error = pthread_condattr_destroy(&attr);
+    if (!error) error = destroy_error;
+    if (error) {
+        while (count) {
+            int cleanup_error = pthread_cond_destroy(&sessions[--count].data_ready);
+            if (cleanup_error) LOG_ERROR("SESSION", "Unable to clean condition: %s", strerror(cleanup_error));
+        }
+        LOG_ERROR("SESSION", "Unable to initialize monotonic session conditions: %s", strerror(error));
+        return;
+    }
+    slots_ready = 1;
 }
 
 static void reset_slot(StreamSession *session) {
@@ -179,6 +200,7 @@ static void *producer_thread(void *argument) {
 int stream_sessions_init(const StreamProducerOps *ops) {
     if (!ops || !ops->start || !ops->stop) return 0;
     pthread_once(&sessions_once, initialize_slots);
+    if (!slots_ready) return 0;
     pthread_mutex_lock(&sessions_mutex);
     if (active_producers != 0) {
         pthread_mutex_unlock(&sessions_mutex);
@@ -195,6 +217,7 @@ StreamSession *stream_session_acquire(const StreamConfig *config,
                                       uint64_t *cursor) {
     if (!config || !cursor) return NULL;
     pthread_once(&sessions_once, initialize_slots);
+    if (!slots_ready) return NULL;
     pthread_mutex_lock(&sessions_mutex);
     if (!initialized || shutting_down) {
         pthread_mutex_unlock(&sessions_mutex);
@@ -260,8 +283,8 @@ StreamSession *stream_session_acquire(const StreamConfig *config,
     return available;
 }
 
-static void realtime_deadline(struct timespec *deadline, int timeout_ms) {
-    clock_gettime(CLOCK_REALTIME, deadline);
+static void monotonic_deadline(struct timespec *deadline, int timeout_ms) {
+    clock_gettime(CLOCK_MONOTONIC, deadline);
     deadline->tv_sec += timeout_ms / 1000;
     deadline->tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
     if (deadline->tv_nsec >= 1000000000L) {
@@ -277,7 +300,7 @@ ssize_t stream_session_read(StreamSession *session,
                             int timeout_ms) {
     if (!session || !cursor || !buffer || buffer_size == 0) return -1;
     struct timespec deadline;
-    realtime_deadline(&deadline, timeout_ms);
+    monotonic_deadline(&deadline, timeout_ms);
 
     pthread_mutex_lock(&sessions_mutex);
     while (*cursor == session->write_position &&
@@ -328,7 +351,11 @@ void stream_session_release(StreamSession *session) {
 
 const char *stream_session_error(StreamSession *session) {
     if (!session) return "Stream session unavailable";
-    return session->error[0] ? session->error : "Stream producer stopped";
+    static _Thread_local char error[160];
+    pthread_mutex_lock(&sessions_mutex);
+    snprintf(error, sizeof(error), "%s", session->error[0] ? session->error : "Stream producer stopped");
+    pthread_mutex_unlock(&sessions_mutex);
+    return error;
 }
 
 size_t stream_sessions_active_count(void) {
@@ -340,6 +367,7 @@ size_t stream_sessions_active_count(void) {
 
 void stream_sessions_shutdown(void) {
     pthread_once(&sessions_once, initialize_slots);
+    if (!slots_ready) return;
     pthread_mutex_lock(&sessions_mutex);
     shutting_down = 1;
     for (size_t i = 0; i < MAX_STREAM_SESSIONS; i++) {

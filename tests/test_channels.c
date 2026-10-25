@@ -5,20 +5,24 @@
 #include <unistd.h>
 
 #include "channels.h"
+int g_verbose = 0;
 
 static void write_fixture(FILE *file) {
     fputs("[MARKET-A]\n"
           "\tVCHANNEL = 15.1\n"
-          "\tSERVICE_ID = 3\n"
+          "\tSERVICE_ID = 08\n"
           "\tFREQUENCY = 581000000\n\n"
           "[MARKET-B]\n"
           "\tVCHANNEL = 15.1\n"
-          "\tSERVICE_ID = 7\n"
+          "\tSERVICE_ID = 010\n"
           "\tFREQUENCY = 587000000\n\n"
           "[UNIQUE]\n"
           "\tVCHANNEL = 21.2\n"
-          "\tSERVICE_ID = 9\n"
-          "\tFREQUENCY = 593000000\n",
+          "\tSERVICE_ID = 0x0b\n"
+          "\tFREQUENCY = 593000000\n"
+          "[INVALID-VCN]\nVCHANNEL = 22.1\" injected=\"value\nSERVICE_ID = 10\nFREQUENCY = 593000000\n"
+          "[INVALID-FREQUENCY]\nVCHANNEL = 23.1\nSERVICE_ID = 11\nFREQUENCY = 593000000\"\n"
+          "[INVALID-SERVICE]\nVCHANNEL = 24.1\nSERVICE_ID = 12\"\nFREQUENCY = 593000000\n",
           file);
 }
 
@@ -38,6 +42,11 @@ int main(void) {
     Channel *first = find_channel_by_frequency_number("581000000", "15.1");
     Channel *second = find_channel_by_frequency_number("587000000", "15.1");
     assert(first != NULL && second != NULL && first != second);
+    assert(!strcmp(first->service_id, "8"));
+    assert(!strcmp(second->service_id, "10"));
+    assert(find_channel_by_freq_sid("581000000", 8) == first);
+    assert(find_channel_by_freq_sid("587000000", 10) == second);
+    assert(!find_channel_by_freq_sid("587000000", 8));
 
     char first_id[128];
     char second_id[128];
@@ -52,6 +61,8 @@ int main(void) {
     Channel *unique = find_channel_by_id("21.2");
     assert(unique != NULL);
     assert(strcmp(unique->frequency, "593000000") == 0);
+    assert(!strcmp(unique->service_id, "11"));
+    assert(find_channel_by_freq_sid("593000000", 11) == unique);
 
     puts("channel identity tests: OK");
     return 0;

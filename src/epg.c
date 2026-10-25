@@ -27,6 +27,9 @@
 #include <signal.h>
 #include <stdatomic.h>
 #include <stdint.h>
+#include <spawn.h>
+#include <poll.h>
+#include "tune_config.h"
 #include "epg.h"
 #include "config.h"
 #include "log.h"
@@ -35,13 +38,33 @@
 #include "db.h"
 #include "huffman.h"
 
+extern char **environ;
+
 /* ============================================================================
  * Data Structures
  * ============================================================================ */
 
+#ifndef EPG_SCAN_TIMEOUT_MS
+#define EPG_SCAN_TIMEOUT_MS 50000
+#endif
+
 #define TS_PACKET_SIZE 188   /* MPEG-TS packet size */
-#define MAX_EIT_PIDS 8       /* Max EIT PIDs to track per mux */
-#define MAX_TRACKED_PIDS 16  /* ATSC PSIP requires base PID 0x1FFB + up to 8 EIT PIDs */
+#define MAX_SCAN_PROGRAMS 8192
+#define MAX_PENDING_ETT 2048
+
+typedef struct {
+    int source_id, event_id;
+    char description[1024];
+} PendingDescription;
+
+#define EVENT_INDEX_SIZE 32768 /* < 1/3 full at the combined program/ETT caps */
+typedef struct {
+    int source_id, event_id;
+    int program_plus_one, pending_plus_one;
+} EventIndex;
+
+#define MAX_GUIDE_PIDS 16    /* Up to eight EIT and eight event ETT PIDs */
+#define MAX_TRACKED_PIDS (MAX_GUIDE_PIDS + 1) /* Include base PID 0x1FFB */
 
 /**
  * Buffer for accumulating PSI/SI section data across TS packets
@@ -67,10 +90,14 @@ typedef struct {
  */
 typedef struct {
     TrackedPidBuffer pid_buffers[MAX_TRACKED_PIDS]; /* Dynamically mapped active PIDs */
-    int eit_pids[MAX_EIT_PIDS];       /* Discovered EIT PIDs from MGT */
-    int eit_pid_count;                /* Number of EIT PIDs found */
+    int guide_pids[MAX_GUIDE_PIDS];       /* Discovered EIT/ETT PIDs from MGT */
+    int guide_pid_count;                /* Number of guide PIDs found */
     int programs_found;               /* Number of programs found (stat) */
     const char *freq;                 /* Current frequency being scanned */
+    EventIndex *event_index;
+    PendingDescription *pending;
+    int pending_count, pending_capacity;
+    int limit_warned;
     ProgramList list;                 /* Buffered programs */
 } ScanContext;
 
@@ -124,9 +151,6 @@ static pthread_cond_t queue_cond = PTHREAD_COND_INITIALIZER;
 /* EPG thread state */
 static atomic_int epg_running = 0;
 int epg_skip_first = 0;
-static int epg_completed_cycles = 0;
-static pthread_mutex_t cycle_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t cycle_cond = PTHREAD_COND_INITIALIZER;
 static pthread_t worker_threads[MAX_TUNERS];
 static int worker_thread_count = 0;
 static pthread_t orchestrator_thread;
@@ -140,17 +164,42 @@ static int epg_is_running(void) {
 // Buffer Management
 // -----------------------------------------------------------------------------
 
+/* Scan-local open-addressed index: slots store indices, never pointers into
+ * reallocatable program/description arrays. Existing event keys are retained
+ * when a pending description becomes a program. */
+static EventIndex *ctx_event(ScanContext *ctx, int source_id, int event_id) {
+    if (!ctx->event_index) {
+        ctx->event_index = calloc(EVENT_INDEX_SIZE, sizeof(*ctx->event_index));
+        if (!ctx->event_index) return NULL;
+    }
+    uint32_t hash = (uint32_t)source_id * 2654435761U ^ (uint32_t)event_id * 2246822519U;
+    for (unsigned int n = 0; n < EVENT_INDEX_SIZE; n++) {
+        EventIndex *entry = &ctx->event_index[(hash + n) % EVENT_INDEX_SIZE];
+        if ((!entry->program_plus_one && !entry->pending_plus_one) ||
+            (entry->source_id == source_id && entry->event_id == event_id)) return entry;
+    }
+    return NULL;
+}
+
+static void ctx_free_buffers(ScanContext *ctx) {
+    free(ctx->list.programs);
+    free(ctx->pending);
+    free(ctx->event_index);
+}
+
 void ctx_upsert(ScanContext *ctx, Program *p) {
     if (!ctx) return;
     
-    /* Deduplicate: within a single mux scan, (event_id, source_id) uniquely identifies an event */
-    for (int i = 0; i < ctx->list.count; i++) {
-        if (ctx->list.programs[i].event_id == p->event_id && 
-            ctx->list.programs[i].source_id == p->source_id) {
-            return;
+    EventIndex *entry = ctx_event(ctx, p->source_id, p->event_id);
+    if (!entry || entry->program_plus_one) return;
+
+    if (ctx->list.count >= MAX_SCAN_PROGRAMS) {
+        if (!ctx->limit_warned) {
+            ctx->limit_warned = 1;
+            LOG_WARN("EPG", "Program limit reached for %s", ctx->freq);
         }
+        return;
     }
-    
     if (ctx->list.count >= ctx->list.capacity) {
         int new_cap = ctx->list.capacity == 0 ? 64 : ctx->list.capacity * 2;
         Program *new_ptr = realloc(ctx->list.programs, new_cap * sizeof(Program));
@@ -159,21 +208,61 @@ void ctx_upsert(ScanContext *ctx, Program *p) {
         ctx->list.capacity = new_cap;
     }
     
-    ctx->list.programs[ctx->list.count++] = *p;
+    Program merged = *p;
+    entry->source_id = p->source_id;
+    entry->event_id = p->event_id;
+    entry->program_plus_one = ctx->list.count + 1;
+    if (entry->pending_plus_one) {
+        int index = entry->pending_plus_one - 1;
+        snprintf(merged.description, sizeof(merged.description), "%s", ctx->pending[index].description);
+        ctx->pending[index] = ctx->pending[--ctx->pending_count];
+        if (index < ctx->pending_count) {
+            PendingDescription *moved = &ctx->pending[index];
+            EventIndex *moved_entry = ctx_event(ctx, moved->source_id, moved->event_id);
+            if (moved_entry) moved_entry->pending_plus_one = index + 1;
+        }
+        entry->pending_plus_one = 0;
+    }
+    ctx->list.programs[ctx->list.count++] = merged;
     ctx->programs_found++;
 }
 
 void ctx_update_description(ScanContext *ctx, int source_id, int event_id,
                             const char *desc) {
     if (!ctx || !desc || !desc[0]) return;
-    for (int i = 0; i < ctx->list.count; i++) {
-        if (ctx->list.programs[i].source_id == source_id &&
-            ctx->list.programs[i].event_id == event_id) {
-            strncpy(ctx->list.programs[i].description, desc, sizeof(ctx->list.programs[i].description) - 1);
-            ctx->list.programs[i].description[sizeof(ctx->list.programs[i].description) - 1] = '\0';
-            return;
-        }
+    EventIndex *entry = ctx_event(ctx, source_id, event_id);
+    if (!entry) return;
+    if (entry->program_plus_one) {
+        Program *program = &ctx->list.programs[entry->program_plus_one - 1];
+        snprintf(program->description, sizeof(program->description), "%s", desc);
+        return;
     }
+    if (entry->pending_plus_one) {
+        PendingDescription *pending = &ctx->pending[entry->pending_plus_one - 1];
+        snprintf(pending->description, sizeof(pending->description), "%s", desc);
+        return;
+    }
+    if (ctx->pending_count == MAX_PENDING_ETT) {
+        if (!ctx->limit_warned) {
+            ctx->limit_warned = 1;
+            LOG_WARN("EPG", "Pending description limit reached for %s", ctx->freq);
+        }
+        return;
+    }
+    if (ctx->pending_count == ctx->pending_capacity) {
+        int capacity = ctx->pending_capacity ? ctx->pending_capacity * 2 : 16;
+        PendingDescription *pending = realloc(ctx->pending, capacity * sizeof(*pending));
+        if (!pending) return;
+        ctx->pending = pending;
+        ctx->pending_capacity = capacity;
+    }
+    entry->source_id = source_id;
+    entry->event_id = event_id;
+    entry->pending_plus_one = ctx->pending_count + 1;
+    PendingDescription *pending = &ctx->pending[ctx->pending_count++];
+    pending->source_id = source_id;
+    pending->event_id = event_id;
+    snprintf(pending->description, sizeof(pending->description), "%s", desc);
 }
 
 // -----------------------------------------------------------------------------
@@ -310,7 +399,7 @@ void *scanner_worker(void *arg) {
         active_scan_jobs--;
         pthread_mutex_unlock(&queue_mutex);
 
-        if (ctx->list.programs) free(ctx->list.programs);
+        ctx_free_buffers(ctx);
         free(ctx);
         release_tuner(t, lease_generation);
     }
@@ -372,11 +461,6 @@ void *epg_orchestrator(void *arg) {
         LOG_INFO("EPG", "Scan cycle complete");
         fflush(stdout);
 
-        pthread_mutex_lock(&cycle_mutex);
-        epg_completed_cycles++;
-        pthread_cond_broadcast(&cycle_cond);
-        pthread_mutex_unlock(&cycle_mutex);
-
         LOG_DEBUG("EPG", "Sleeping 15 minutes...");
         fflush(stdout);
         for(int k=0; k<15*60; k++) {
@@ -385,16 +469,6 @@ void *epg_orchestrator(void *arg) {
         }
     }
     return NULL;
-}
-
-void wait_for_first_epg_scan() {
-    LOG_INFO("EPG", "Waiting for first scan cycle to complete...");
-    fflush(stdout);
-    pthread_mutex_lock(&cycle_mutex);
-    while (epg_completed_cycles == 0 && epg_is_running()) {
-        pthread_cond_wait(&cycle_cond, &cycle_mutex);
-    }
-    pthread_mutex_unlock(&cycle_mutex);
 }
 
 void start_epg_thread() {
@@ -455,7 +529,6 @@ void stop_epg_thread() {
 
     cancel_tuner_users(USER_EPG);
     pthread_cond_broadcast(&queue_cond);
-    pthread_cond_broadcast(&cycle_cond);
     if (orchestrator_started) {
         pthread_join(orchestrator_thread, NULL);
         orchestrator_started = 0;
@@ -533,12 +606,12 @@ void handle_section(ScanContext *ctx, int pid, const unsigned char *section,
     if (declared_length != len || !section_crc_valid(section, len)) return;
     unsigned char table_id = section[0];
     
-    int is_eit_pid = 0;
-    for (int k = 0; k < ctx->eit_pid_count; k++) {
-        if (ctx->eit_pids[k] == pid) { is_eit_pid = 1; break; }
+    int is_guide_pid = 0;
+    for (int k = 0; k < ctx->guide_pid_count; k++) {
+        if (ctx->guide_pids[k] == pid) { is_guide_pid = 1; break; }
     }
     
-    if (pid == 0x1FFB || is_eit_pid) {
+    if (pid == 0x1FFB || is_guide_pid) {
         if (table_id == 0xC7) {
             if (len < 11) return;
             int tables_defined = (section[9] << 8) | section[10];
@@ -548,13 +621,14 @@ void handle_section(ScanContext *ctx, int pid, const unsigned char *section,
                 int type = (section[loop_offset] << 8) | section[loop_offset+1];
                 int t_pid = ((section[loop_offset+2] & 0x1F) << 8) | section[loop_offset+3];
                 
-                if (type >= 0x0100 && type <= 0x017F) {
-                    if (ctx->eit_pid_count < MAX_EIT_PIDS) {
+                if ((type >= 0x0100 && type <= 0x017F) ||
+                    (type >= 0x0200 && type <= 0x027F)) {
+                    if (ctx->guide_pid_count < MAX_GUIDE_PIDS) {
                         int found = 0;
-                        for (int k = 0; k < ctx->eit_pid_count; k++) {
-                            if (ctx->eit_pids[k] == t_pid) { found = 1; break; }
+                        for (int k = 0; k < ctx->guide_pid_count; k++) {
+                            if (ctx->guide_pids[k] == t_pid) { found = 1; break; }
                         }
-                        if (!found) ctx->eit_pids[ctx->eit_pid_count++] = t_pid;
+                        if (!found) ctx->guide_pids[ctx->guide_pid_count++] = t_pid;
                     }
                 }
                 int desc_len = ((section[loop_offset+9] & 0x0F) << 8) | section[loop_offset+10];
@@ -593,8 +667,8 @@ int parse_ts_chunk(ScanContext *ctx, const unsigned char *buf, size_t len) {
 
         int interesting = (pid == 0x1FFB);
         if (!interesting) {
-            for (int k = 0; k < ctx->eit_pid_count; k++) {
-                if (ctx->eit_pids[k] == pid) { interesting = 1; break; }
+            for (int k = 0; k < ctx->guide_pid_count; k++) {
+                if (ctx->guide_pids[k] == pid) { interesting = 1; break; }
             }
         }
         if (!interesting) continue; 
@@ -707,7 +781,7 @@ void parse_atsc_eit(ScanContext *ctx, const unsigned char *section, int len) {
     for (int i = 0; i < num_events; i++) {
         if (offset + 10 > len) break;
         int event_id = ((section[offset] & 0x3F) << 8) | section[offset + 1];
-        unsigned int start_time_gps = (section[offset + 2] << 24) | (section[offset + 3] << 16) | (section[offset + 4] << 8) | section[offset + 5];
+        unsigned int start_time_gps = ((uint32_t)section[offset + 2] << 24) | (section[offset + 3] << 16) | (section[offset + 4] << 8) | section[offset + 5];
         int duration = ((section[offset + 6] & 0x0F) << 16) | (section[offset + 7] << 8) | section[offset + 8];
         int title_len = section[offset + 9];
 
@@ -755,7 +829,8 @@ void parse_atsc_eit(ScanContext *ctx, const unsigned char *section, int len) {
 
 void parse_atsc_ett(ScanContext *ctx, const unsigned char *section, int len) {
     if (len < 17) return;
-    unsigned int etm_id = (section[9] << 24) | (section[10] << 16) | (section[11] << 8) | section[12];
+    unsigned int etm_id = ((uint32_t)section[9] << 24) | (section[10] << 16) | (section[11] << 8) | section[12];
+    if ((etm_id & 3) != 2) return; /* Only event ETTs carry event descriptions. */
     int source_id = (int)(etm_id >> 16);
     int event_id = (etm_id >> 2) & 0x3FFF;
     
@@ -773,6 +848,22 @@ void parse_atsc_ett(ScanContext *ctx, const unsigned char *section, int len) {
     }
 }
 
+static int64_t epg_now_ms(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+}
+
+static int stop_epg_child(pid_t pid, int *status) {
+    kill(-pid, SIGTERM);
+    struct timespec grace = {.tv_nsec = 250000000};
+    while (nanosleep(&grace, &grace) < 0 && errno == EINTR) {}
+    kill(-pid, SIGKILL);
+    pid_t waited;
+    do { waited = waitpid(pid, status, 0); } while (waited < 0 && errno == EINTR);
+    return waited == pid;
+}
+
 void scan_mux(Tuner *t, unsigned long lease_generation, ScanContext *ctx,
               const char *channel_number, const char *channel_name) {
     int pipefd[2];
@@ -780,30 +871,41 @@ void scan_mux(Tuner *t, unsigned long lease_generation, ScanContext *ctx,
     
     LOG_INFO("EPG", "Scanning Mux %s (%s %s) on Tuner %d", ctx->freq, channel_name, channel_number, t->id);
 
-    pid_t pid = fork();
-    if (pid == 0) {
-        close(pipefd[0]);
-        dup2(pipefd[1], STDOUT_FILENO);
-        close(pipefd[1]);
-        
-        if (!g_verbose) {
-            int devnull = open("/dev/null", O_WRONLY);
-            if (devnull >= 0) {
-                dup2(devnull, STDERR_FILENO);
-                close(devnull);
-            }
-        }
-        
-        char adapter_id[8];
-        snprintf(adapter_id, sizeof(adapter_id), "%d", t->id);
-        execlp("dvbv5-zap", "dvbv5-zap", "-c", channels_conf_path, "-a", adapter_id, "-P", "-t", "45", "-o", "-", channel_number, NULL);
-        _exit(1);
-    } else if (pid > 0) {
+    char tune_path[64];
+    Channel *channel = find_channel_by_frequency_number(ctx->freq, channel_number);
+    if (!channel || !tune_config_create(channels_conf_path, ctx->freq,
+                            channel->service_id, tune_path, sizeof(tune_path))) {
+        close(pipefd[0]); close(pipefd[1]);
+        LOG_ERROR("EPG", "Unable to prepare tuning configuration for %s", ctx->freq);
+        return;
+    }
+    char adapter_id[16];
+    snprintf(adapter_id, sizeof(adapter_id), "%d", t->id);
+    char *args[] = {"dvbv5-zap", "-c", tune_path, "-a", adapter_id,
+                    "-P", "-t", "45", "-o", "-", TUNE_SECTION, NULL};
+    posix_spawn_file_actions_t actions;
+    int error = posix_spawn_file_actions_init(&actions);
+    int ready = error == 0;
+    if (!error) error = posix_spawn_file_actions_adddup2(&actions, pipefd[1], STDOUT_FILENO);
+    if (!error && !g_verbose) error = posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
+    /* No server sockets, SQLite handles or other worker pipes cross exec. */
+    if (!error) error = posix_spawn_file_actions_addclosefrom_np(&actions, 3);
+    posix_spawnattr_t attr;
+    int attr_ready = 0;
+    if (!error) { error = posix_spawnattr_init(&attr); attr_ready = error == 0; }
+    if (!error) error = posix_spawnattr_setpgroup(&attr, 0);
+    if (!error) error = posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP);
+    pid_t pid = -1;
+    if (!error) error = posix_spawnp(&pid, "dvbv5-zap", &actions, &attr, args, environ);
+    if (attr_ready) posix_spawnattr_destroy(&attr);
+    if (ready) posix_spawn_file_actions_destroy(&actions);
+    if (!error) {
         if (!tuner_set_process(t, lease_generation, pid)) {
             close(pipefd[0]);
             close(pipefd[1]);
-            kill(pid, SIGTERM);
-            waitpid(pid, NULL, 0);
+            int status;
+            stop_epg_child(pid, &status);
+            unlink(tune_path);
             if (epg_is_running()) {
                 enqueue_mux(ctx->freq, channel_name, channel_number);
             }
@@ -812,17 +914,53 @@ void scan_mux(Tuner *t, unsigned long lease_generation, ScanContext *ctx,
         close(pipefd[1]);
 
         unsigned char buf[1024 * 32];
-        int leftover = 0;
-        ssize_t n;
-
-        while ((n = read(pipefd[0], buf + leftover, sizeof(buf) - leftover)) > 0) {
-            int total_len = leftover + n;
-            int packet_count = total_len / TS_PACKET_SIZE;
-            int bytes_to_process = packet_count * TS_PACKET_SIZE;
-            if (bytes_to_process > 0) parse_ts_chunk(ctx, buf, bytes_to_process);
-            leftover = total_len - bytes_to_process;
-            if (leftover > 0) memmove(buf, buf + bytes_to_process, leftover);
+        int leftover = 0, eof = 0, child_done = 0, status = 0, status_valid = 0;
+        int flags = fcntl(pipefd[0], F_GETFL);
+        int failed = flags < 0 || fcntl(pipefd[0], F_SETFL, flags | O_NONBLOCK) < 0;
+        int64_t deadline = epg_now_ms() + EPG_SCAN_TIMEOUT_MS;
+        while (!failed && (!eof || !child_done)) {
+            if (!tuner_lease_is_current(t, lease_generation)) { failed = 1; break; }
+            int64_t remaining = deadline - epg_now_ms();
+            if (remaining <= 0) {
+                LOG_WARN("EPG", "Scan deadline exceeded for %s", ctx->freq);
+                failed = 1; break;
+            }
+            struct pollfd fd = {.fd = eof ? -1 : pipefd[0], .events = POLLIN};
+            int result = poll(&fd, 1, remaining > 50 ? 50 : (int)remaining);
+            if (result < 0 && errno != EINTR) { failed = 1; break; }
+            if (result > 0) {
+                ssize_t n = read(pipefd[0], buf + leftover, sizeof(buf) - leftover);
+                if (n > 0) {
+                    int total_len = leftover + n;
+                    int bytes_to_process = total_len / TS_PACKET_SIZE * TS_PACKET_SIZE;
+                    if (bytes_to_process > 0) parse_ts_chunk(ctx, buf, bytes_to_process);
+                    leftover = total_len - bytes_to_process;
+                    if (leftover > 0) memmove(buf, buf + bytes_to_process, leftover);
+                } else if (!n) eof = 1;
+                else if (errno != EAGAIN && errno != EINTR) failed = 1;
+            }
+            if (!child_done) {
+                pid_t waited = waitpid(pid, &status, WNOHANG);
+                if (waited == pid) child_done = status_valid = 1;
+                else if (waited < 0 && errno != EINTR) {
+                    child_done = 1; /* tuner preemption may have reaped it */
+                    if (errno != ECHILD) failed = 1;
+                }
+            }
         }
+        if (failed) status_valid |= stop_epg_child(pid, &status);
+        int preempted = !tuner_lease_is_current(t, lease_generation);
+        tuner_clear_process(t, lease_generation, pid);
+        close(pipefd[0]);
+        if (preempted) {
+            LOG_DEBUG("EPG", "Scan of %s preempted", ctx->freq);
+            if (epg_is_running()) enqueue_mux(ctx->freq, channel_name, channel_number);
+        } else if (!failed && status_valid && WIFSIGNALED(status)) {
+            LOG_WARN("EPG", "Scan child for %s terminated by signal %d; retry deferred to next cycle",
+                     ctx->freq, WTERMSIG(status));
+        }
+        /* Failures and crashes wait for the next cycle, avoiding an endless
+         * immediate retry loop. Persist any complete programs already parsed. */
 
         // Bulk upsert collected programs
         if (ctx->list.count > 0) {
@@ -834,22 +972,10 @@ void scan_mux(Tuner *t, unsigned long lease_generation, ScanContext *ctx,
             LOG_INFO("EPG", "Scan complete for %s %s: No (new) programs found", channel_name, channel_number);
         }
 
-        int status = 0;
-        int status_valid = waitpid(pid, &status, 0) == pid;
-        int preempted = !tuner_lease_is_current(t, lease_generation);
-        tuner_clear_process(t, lease_generation, pid);
-        
-        if (preempted || (status_valid && WIFSIGNALED(status))) {
-            LOG_DEBUG("EPG", "Scan of %s interrupted (likely preempted)", ctx->freq);
-            if (epg_is_running()) {
-                enqueue_mux(ctx->freq, channel_name, channel_number);
-            }
-        }
-
-        close(pipefd[0]);
     } else {
         close(pipefd[0]);
         close(pipefd[1]);
-        LOG_ERROR("EPG", "Failed to fork dvbv5-zap: %s", strerror(errno));
+        LOG_ERROR("EPG", "Failed to spawn dvbv5-zap: %s", strerror(error));
     }
+    unlink(tune_path);
 }

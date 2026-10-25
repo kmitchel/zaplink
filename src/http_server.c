@@ -6,6 +6,8 @@
 #include <sys/socket.h>
 #include <sys/epoll.h>
 #include <netinet/in.h>
+#include <arpa/inet.h>
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -174,6 +176,7 @@ static int write_all(int fd, const char *buf, size_t len) {
             if (errno == EINTR) continue;
             return 0; 
         }
+        if (n == 0) return 0;
         written += n;
     }
     return 1;
@@ -199,7 +202,130 @@ static char *g_m3u_cache = NULL;
 static char g_m3u_cache_host[256] = {0};
 static pthread_mutex_t g_m3u_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+/* M3U has no portable quoted-attribute escape convention. Normalize quotes
+ * and line controls so metadata cannot terminate an attribute or add entries. */
+static void m3u_name(const char *source, char *dest, size_t size) {
+    size_t used = 0;
+    for (; *source && used + 1 < size; source++) {
+        unsigned char c = (unsigned char)*source;
+        dest[used++] = c == '"' ? '\'' : (c < 32 || c == 127 ? ' ' : (char)c);
+    }
+    dest[used] = 0;
+}
+
+/* Restrict playlist URL authorities to hostnames (including underscores) or bracketed IPv6,
+ * with an optional numeric port. URL delimiters and controls are rejected. */
+static int valid_playlist_host(const char *host) {
+    if (!host || !*host || strlen(host) > 255) return 0;
+    const char *port = NULL;
+    if (*host == '[') {
+        const char *end = strchr(host, ']');
+        if (!end) return 0;
+        const char *zone = memchr(host + 1, '%', end - host - 1);
+        size_t address_length = (zone ? zone : end) - host - 1;
+        if (address_length >= INET6_ADDRSTRLEN) return 0;
+        if (zone) {
+            const char *name = zone + 1;
+            /* %25 always denotes the encoded delimiter. Raw numeric scopes
+             * require encoding; guessing would change scopes beginning in 25. */
+            int encoded = end - name >= 2 && name[0] == '2' && name[1] == '5';
+            if (encoded) name += 2;
+            if (name == end || end - name > 63) return 0;
+            int numeric = 1;
+            for (const char *p = name; p < end; p++) {
+                unsigned char c = (unsigned char)*p;
+                if (c < '0' || c > '9') numeric = 0;
+                if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                      (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.' || c == '~')) return 0;
+            }
+            if (numeric && !encoded) return 0;
+        }
+        char address[INET6_ADDRSTRLEN];
+        memcpy(address, host + 1, address_length);
+        address[address_length] = 0;
+        struct in6_addr parsed;
+        if (inet_pton(AF_INET6, address, &parsed) != 1) return 0;
+        if (end[1]) { if (end[1] != ':') return 0; port = end + 2; }
+    } else {
+        const char *end = strchr(host, ':');
+        if (!end) end = host + strlen(host);
+        if (end == host || end - host > 253) return 0;
+        int label_length = 0;
+        for (const char *p = host; p < end; p++) {
+            unsigned char c = (unsigned char)*p;
+            if (c == '.') {
+                if (!label_length || p[-1] == '-') return 0;
+                label_length = 0;
+            } else {
+                if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                      (c >= '0' && c <= '9') || c == '-' || c == '_')) return 0;
+                if ((!label_length && c == '-') || ++label_length > 63) return 0;
+            }
+        }
+        if (end[-1] == '-') return 0;
+        if (*end == ':') port = end + 1;
+    }
+    if (port) {
+        if (!*port || strlen(port) > 5) return 0;
+        unsigned int number = 0;
+        for (; *port; port++) {
+            if (*port < '0' || *port > '9') return 0;
+            number = number * 10 + (unsigned int)(*port - '0');
+        }
+        if (!number || number > 65535) return 0;
+    }
+    return 1;
+}
+
+/* Raw zone delimiters accepted in Host are percent-encoded in playlist URLs. */
+static int playlist_authority(const char *host, char *output, size_t size) {
+    if (!valid_playlist_host(host)) return 0;
+    const char *zone = *host == '[' ? strchr(host, '%') : NULL;
+    if (zone && strncmp(zone, "%25", 3)) {
+        size_t prefix = zone - host;
+        if (strlen(host) + 3 > size) return 0;
+        memcpy(output, host, prefix);
+        memcpy(output + prefix, "%25", 3);
+        strcpy(output + prefix + 3, zone + 1);
+    } else {
+        if (strlen(host) >= size) return 0;
+        strcpy(output, host);
+    }
+    return 1;
+}
+
+static int request_playlist_host(const char *request, char *host, size_t size) {
+    const char *line = strstr(request, "\r\n");
+    if (!line) return 0;
+    line += 2;
+    int seen = 0;
+    while (*line) {
+        const char *end = strstr(line, "\r\n");
+        if (!end) return 0;
+        if (end == line) break;
+        const char *colon = memchr(line, ':', end - line);
+        if (colon && colon - line == 4 && !strncasecmp(line, "Host", 4)) {
+            if (seen++) return 0;
+            const char *value = colon + 1;
+            while (value < end && (*value == ' ' || *value == '\t')) value++;
+            const char *value_end = end;
+            while (value_end > value && (value_end[-1] == ' ' || value_end[-1] == '\t')) value_end--;
+            size_t length = value_end - value;
+            if (!length || length >= size) return 0;
+            memcpy(host, value, length); host[length] = 0;
+        }
+        line = end + 2;
+    }
+    return valid_playlist_host(host);
+}
+
 void handle_m3u(int sockfd, const char *host, const char *query, int head_only) {
+    char authority[256];
+    if (!playlist_authority(host, authority, sizeof(authority))) {
+        send_response_ex(sockfd, "400 Bad Request", "text/plain", "Invalid Host header", head_only);
+        return;
+    }
+    host = authority;
     // If query params exist, ignore cache and generate dynamic
     // Otherwise serve from cache if host matches
     
@@ -235,17 +361,19 @@ void handle_m3u(int sockfd, const char *host, const char *query, int head_only) 
 
     for (int i = 0; i < channel_count; i++) {
         char entry[2048];
+        char name[64];
+        m3u_name(channels[i].name, name, sizeof(name));
         char channel_id[128];
         get_unique_channel_id(&channels[i], channel_id, sizeof(channel_id));
         if (query && query[0] != '\0') {
             snprintf(entry, sizeof(entry), "#EXTINF:-1 tvg-id=\"%.127s\" tvg-name=\"%.63s\",%.31s %.63s\nhttp://%.255s/stream/%.127s%s?%.1023s\n",
-                     channel_id, channels[i].name, channels[i].number,
-                     channels[i].name, host, channel_id,
+                     channel_id, name, channels[i].number,
+                     name, host, channel_id,
                      stream_config_extension(&playlist_config), query);
         } else {
             snprintf(entry, sizeof(entry), "#EXTINF:-1 tvg-id=\"%.127s\" tvg-name=\"%.63s\",%.31s %.63s\nhttp://%.255s/stream/%.127s%s\n",
-                     channel_id, channels[i].name, channels[i].number,
-                     channels[i].name, host, channel_id,
+                     channel_id, name, channels[i].number,
+                     name, host, channel_id,
                      stream_config_extension(&playlist_config));
         }
         
@@ -272,7 +400,7 @@ void handle_m3u(int sockfd, const char *host, const char *query, int head_only) 
         pthread_mutex_lock(&g_m3u_mutex);
         if (g_m3u_cache) free(g_m3u_cache);
         g_m3u_cache = strdup(m3u);
-        strncpy(g_m3u_cache_host, host, sizeof(g_m3u_cache_host)-1);
+        snprintf(g_m3u_cache_host, sizeof(g_m3u_cache_host), "%s", host);
         pthread_mutex_unlock(&g_m3u_mutex);
     }
 
@@ -309,19 +437,17 @@ void process_client_request(void *arg) {
     }
 
     // Parse Host header
-    char host[256] = "localhost:18392";
-    char *host_hdr = strcasestr(buffer, "Host: ");
-    if (host_hdr) {
-        host_hdr += 6;
-        char *end = strchr(host_hdr, '\r');
-        if (!end) end = strchr(host_hdr, '\n');
-        if (end) {
-            size_t len = end - host_hdr;
-            if (len < sizeof(host)) {
-                strncpy(host, host_hdr, len);
-                host[len] = '\0';
-            }
-        }
+    char host[256];
+    struct sockaddr_in local_address;
+    socklen_t address_size = sizeof(local_address);
+    unsigned int local_port = 18392;
+    if (getsockname(sockfd, (struct sockaddr *)&local_address, &address_size) == 0)
+        local_port = ntohs(local_address.sin_port);
+    snprintf(host, sizeof(host), "localhost:%u", local_port);
+    if (!request_playlist_host(buffer, host, sizeof(host))) {
+        send_response_ex(sockfd, "400 Bad Request", "text/plain", "Invalid Host header", head_only);
+        finish_client(ctx);
+        return;
     }
 
     char path[1024];

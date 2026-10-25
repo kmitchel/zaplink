@@ -19,6 +19,7 @@
 #include <unistd.h>
 
 #include "channels.h"
+#include "tune_config.h"
 #include "config.h"
 #include "log.h"
 #include "stream_session.h"
@@ -31,6 +32,7 @@ typedef struct {
     pid_t ffmpeg_pid;
     Tuner *tuner;
     unsigned long lease_generation;
+    char tune_path[64];
 } PipelineContext;
 
 extern char **environ;
@@ -46,6 +48,11 @@ static int validate_channel_id(const char *value) {
     return 1;
 }
 
+static void destroy_pipeline_context(PipelineContext *context) {
+    if (context->tune_path[0]) unlink(context->tune_path);
+    free(context);
+}
+
 static int write_all(int fd, const void *data, size_t length) {
     const unsigned char *cursor = data;
     while (length > 0) {
@@ -54,6 +61,7 @@ static int write_all(int fd, const void *data, size_t length) {
             if (errno == EINTR) continue;
             return 0;
         }
+        if (written == 0) return 0;
         cursor += written;
         length -= (size_t)written;
     }
@@ -127,7 +135,7 @@ static void *reap_pipeline(void *opaque) {
     release_tuner(context->tuner, context->lease_generation);
     LOG_INFO("TRANSCODE", "Quarantined pipeline group %d was reaped",
              context->process_group);
-    free(context);
+    destroy_pipeline_context(context);
     return NULL;
 }
 
@@ -448,14 +456,24 @@ static int start_pipeline(const StreamConfig *config, StreamProducer *producer) 
     }
     context->tuner = tuner;
     context->lease_generation = lease_generation;
+    if (!tune_config_create(channels_conf_path, channel->frequency,
+                            channel->service_id, context->tune_path,
+                            sizeof(context->tune_path))) {
+        close_pipeline_pipes(zap_pipe, output_pipe);
+        release_tuner(tuner, lease_generation);
+        snprintf(producer->error, sizeof(producer->error),
+                 "Unable to prepare exact station tuning configuration");
+        destroy_pipeline_context(context);
+        return -1;
+    }
 
     int all_pipes[4] = {zap_pipe[0], zap_pipe[1],
                         output_pipe[0], output_pipe[1]};
     char adapter[16];
     snprintf(adapter, sizeof(adapter), "%d", tuner->id);
     char *zap_arguments[] = {
-        "dvbv5-zap", "-c", channels_conf_path, "-a", adapter,
-        "-p", "-o", "-", channel->number, NULL
+        "dvbv5-zap", "-c", context->tune_path, "-a", adapter,
+        "-p", "-o", "-", TUNE_SECTION, NULL
     };
 
     posix_spawn_file_actions_t zap_actions;
@@ -478,7 +496,7 @@ static int start_pipeline(const StreamConfig *config, StreamProducer *producer) 
         release_tuner(tuner, lease_generation);
         snprintf(producer->error, sizeof(producer->error),
                  "Unable to start dvbv5-zap: %s", strerror(spawn_error));
-        free(context);
+        destroy_pipeline_context(context);
         return -1;
     }
     context->process_group = context->zap_pid;
@@ -487,7 +505,7 @@ static int start_pipeline(const StreamConfig *config, StreamProducer *producer) 
         close_pipeline_pipes(zap_pipe, output_pipe);
         snprintf(producer->error, sizeof(producer->error),
                  "Tuner lease expired while starting dvbv5-zap");
-        if (stopped || !schedule_pipeline_reaper(context)) free(context);
+        if (stopped || !schedule_pipeline_reaper(context)) destroy_pipeline_context(context);
         return -1;
     }
 
@@ -519,7 +537,7 @@ static int start_pipeline(const StreamConfig *config, StreamProducer *producer) 
         close(output_pipe[0]);
         snprintf(producer->error, sizeof(producer->error),
                  "Unable to start FFmpeg: %s", strerror(spawn_error));
-        if (stopped || !schedule_pipeline_reaper(context)) free(context);
+        if (stopped || !schedule_pipeline_reaper(context)) destroy_pipeline_context(context);
         return -1;
     }
 
@@ -555,7 +573,7 @@ static void stop_pipeline(StreamProducer *producer) {
                       context->process_group, context->tuner->id);
             context_owned_by_reaper = schedule_pipeline_reaper(context);
         }
-        if (!context_owned_by_reaper) free(context);
+        if (!context_owned_by_reaper) destroy_pipeline_context(context);
     }
     producer->opaque = NULL;
 }

@@ -8,10 +8,9 @@
  * 
  * Output formats:
  * - XMLTV: Standard format for EPG interchange, compatible with Jellyfin/Plex
- * - JSON: Lightweight format for web clients
  * 
  * The database is stored in the working directory as epg.db.
- * Expired entries (ended > 24 hours ago) are periodically cleaned up.
+ * Expired entries (ended > 48 hours ago) are periodically cleaned up.
  */
 
 #define _GNU_SOURCE
@@ -74,7 +73,7 @@ int db_init() {
         return 0;
     }
 
-    // Index for title to speed up series detection (counting occurrences)
+    // Indexes for guide queries
     char *sql_idx = "CREATE INDEX IF NOT EXISTS idx_programs_title ON programs(title);"
                     "CREATE INDEX IF NOT EXISTS idx_programs_endtime ON programs(end_time);"
                     "CREATE INDEX IF NOT EXISTS idx_programs_channel ON programs(channel_service_id);";
@@ -233,15 +232,14 @@ char *db_get_xmltv_programs() {
     for (int i = 0; i < channel_count; i++) {
         char unique_id[128];
         get_unique_channel_id(&channels[i], unique_id, sizeof(unique_id));
-        char buf[256];
-        snprintf(buf, sizeof(buf), "  <channel id=\"%s\">\n    <display-name>", unique_id);
-        APPEND_OR_FAIL(append_str(&xml, &size, &cap, buf));
+        APPEND_OR_FAIL(append_str(&xml, &size, &cap, "  <channel id=\""));
+        APPEND_OR_FAIL(xml_escape_append(&xml, &size, &cap, unique_id));
+        APPEND_OR_FAIL(append_str(&xml, &size, &cap, "\">\n    <display-name>"));
         APPEND_OR_FAIL(xml_escape_append(&xml, &size, &cap, channels[i].name));
         APPEND_OR_FAIL(append_str(&xml, &size, &cap, "</display-name>\n  </channel>\n"));
     }
 
-    const char *sql = "SELECT title, description, start_time, end_time, channel_service_id, frequency, event_id, "
-                      "(SELECT COUNT(*) FROM programs p2 WHERE p2.title = programs.title) as title_count "
+    const char *sql = "SELECT title, description, start_time, end_time, channel_service_id, frequency "
                       "FROM programs "
                       "WHERE end_time > ? "
                       "ORDER BY CAST(SUBSTR(channel_service_id, 1, INSTR(channel_service_id, '.') - 1) AS INTEGER), "
@@ -262,7 +260,6 @@ char *db_get_xmltv_programs() {
         long long end = sqlite3_column_int64(stmt, 3);
         const char *svc_id = (const char *)sqlite3_column_text(stmt, 4);
         const char *freq = (const char *)sqlite3_column_text(stmt, 5);
-        int event_id = sqlite3_column_int(stmt, 6);
 
         Channel *ch = NULL;
         if (freq && svc_id) {
@@ -288,25 +285,16 @@ char *db_get_xmltv_programs() {
         strftime(end_str, 32, "%Y%m%d%H%M%S +0000", &tm_e_buf);
 
         char buf[512];
-        snprintf(buf, sizeof(buf), "  <programme start=\"%s\" stop=\"%s\" channel=\"%s\">\n", 
-                 start_str, end_str, channel_id);
+        snprintf(buf, sizeof(buf), "  <programme start=\"%s\" stop=\"%s\" channel=\"", start_str, end_str);
         APPEND_OR_FAIL(append_str(&xml, &size, &cap, buf));
+        APPEND_OR_FAIL(xml_escape_append(&xml, &size, &cap, channel_id));
+        APPEND_OR_FAIL(append_str(&xml, &size, &cap, "\">\n"));
         APPEND_OR_FAIL(append_str(&xml, &size, &cap, "    <title>"));
         APPEND_OR_FAIL(xml_escape_append(&xml, &size, &cap, title));
         APPEND_OR_FAIL(append_str(&xml, &size, &cap, "</title>\n"));
         APPEND_OR_FAIL(append_str(&xml, &size, &cap, "    <desc>"));
         APPEND_OR_FAIL(xml_escape_append(&xml, &size, &cap, desc));
         APPEND_OR_FAIL(append_str(&xml, &size, &cap, "</desc>\n"));
-        
-        char ep_str[64];
-        snprintf(ep_str, sizeof(ep_str), "    <episode-num system=\"xmltv_ns\">0.%d.</episode-num>\n", event_id);
-        APPEND_OR_FAIL(append_str(&xml, &size, &cap, ep_str));
-        APPEND_OR_FAIL(append_str(&xml, &size, &cap, "    <new />\n"));
-        
-        int title_count = sqlite3_column_int(stmt, 7);
-        if (title_count > 1) {
-            APPEND_OR_FAIL(append_str(&xml, &size, &cap, "    <category>Series</category>\n"));
-        }
         
         APPEND_OR_FAIL(append_str(&xml, &size, &cap, "  </programme>\n"));
     }
@@ -333,140 +321,6 @@ oom_fail:
     return NULL;
 }
 
-// Returns 0 on OOM, 1 on success.
-// Batches runs of non-special characters to reduce per-character call overhead.
-static int json_escape_append(char **dest, size_t *size, size_t *cap, const char *src) {
-    if (!src) return 1;
-    const char *run_start = src;
-    for (const char *p = src; ; p++) {
-        const char *esc = NULL;
-        char esc_buf[8];
-        if (*p == '"')        esc = "\\\"";
-        else if (*p == '\\') esc = "\\\\";
-        else if (*p == '\n')  esc = "\\n";
-        else if (*p == '\r')  esc = "\\r";
-        else if (*p == '\t')  esc = "\\t";
-        else if ((unsigned char)*p < 0x20 && *p != '\0') {
-            snprintf(esc_buf, sizeof(esc_buf), "\\u%04x", (unsigned char)*p);
-            esc = esc_buf;
-        } else if (*p != '\0') continue;  /* ordinary character, extend the run */
-
-        /* Flush any accumulated plain-text run */
-        if (p > run_start) {
-            size_t run_len = (size_t)(p - run_start);
-            if (*size + run_len + 1 > *cap) {
-                size_t new_cap = (*size + run_len + 1) * 2;
-                if (new_cap < *cap + 1024 * 1024) new_cap = *cap + 1024 * 1024;
-                char *tmp = realloc(*dest, new_cap);
-                if (!tmp) return 0;
-                *dest = tmp;
-                *cap = new_cap;
-            }
-            memcpy(*dest + *size, run_start, run_len);
-            *size += run_len;
-            (*dest)[*size] = '\0';
-        }
-
-        if (*p == '\0') break;
-        if (!append_str(dest, size, cap, esc)) return 0;
-        run_start = p + 1;
-    }
-    return 1;
-}
-
-char *db_get_json_programs() {
-    if (!db) return NULL;
-    pthread_mutex_lock(&db_stmt_mutex);
-    
-    // (Optional: Implement JSON caching here too if needed, but skipped for now as per plan/task)
-
-    const char *sql = "SELECT title, description, start_time, end_time, channel_service_id, frequency FROM programs "
-                "WHERE end_time > ? "
-                "ORDER BY CAST(channel_service_id AS INTEGER), "
-                "CASE WHEN INSTR(channel_service_id, '.') > 0 THEN CAST(SUBSTR(channel_service_id, INSTR(channel_service_id, '.') + 1) AS INTEGER) ELSE 0 END, "
-                "start_time";
-    
-    sqlite3_stmt *stmt;
-    int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, 0);
-    
-    if (rc != SQLITE_OK) {
-        LOG_ERROR("DB", "Failed to fetch data: %s", sqlite3_errmsg(db));
-        pthread_mutex_unlock(&db_stmt_mutex);
-        return NULL;
-    }
-
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    long long now_ms = (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-    sqlite3_bind_int64(stmt, 1, now_ms);
-
-    size_t cap = 1024 * 1024;
-    size_t size = 0;
-    char *json = malloc(cap);
-    if (!json) {
-        sqlite3_finalize(stmt);
-        pthread_mutex_unlock(&db_stmt_mutex);
-        return NULL;
-    }
-    json[0] = '\0';
-
-    APPEND_OR_FAIL(append_str(&json, &size, &cap, "{\n  \"channels\": [\n"));
-
-    for (int i = 0; i < channel_count; i++) {
-        char buf[256];
-        char channel_id[128];
-        get_unique_channel_id(&channels[i], channel_id, sizeof(channel_id));
-        snprintf(buf, sizeof(buf), "    {\"id\": \"%s\", \"name\": \"",
-                 channel_id);
-        APPEND_OR_FAIL(append_str(&json, &size, &cap, buf));
-        APPEND_OR_FAIL(json_escape_append(&json, &size, &cap, channels[i].name));
-        APPEND_OR_FAIL(append_str(&json, &size, &cap, "\"}"));
-        if (i < channel_count - 1) APPEND_OR_FAIL(append_str(&json, &size, &cap, ","));
-        APPEND_OR_FAIL(append_str(&json, &size, &cap, "\n"));
-    }
-
-    APPEND_OR_FAIL(append_str(&json, &size, &cap, "  ],\n  \"programs\": [\n"));
-
-    int first = 1;
-    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
-        const char *title = (const char *)sqlite3_column_text(stmt, 0);
-        const char *desc = (const char *)sqlite3_column_text(stmt, 1);
-        long long start = sqlite3_column_int64(stmt, 2);
-        long long end = sqlite3_column_int64(stmt, 3);
-        const char *svc_id = (const char *)sqlite3_column_text(stmt, 4);
-        const char *freq = (const char *)sqlite3_column_text(stmt, 5);
-        char channel_id[128];
-        Channel *channel = (freq && svc_id) ? find_channel_fast(freq, svc_id) : NULL;
-        if (channel) get_unique_channel_id(channel, channel_id, sizeof(channel_id));
-        else snprintf(channel_id, sizeof(channel_id), "%s", svc_id ? svc_id : "");
-
-        if (!first) APPEND_OR_FAIL(append_str(&json, &size, &cap, ",\n"));
-        first = 0;
-
-        char buf[256];
-        snprintf(buf, sizeof(buf), "    {\"channel\": \"%s\", \"start\": %lld, \"end\": %lld, \"title\": \"",
-            channel_id, start, end);
-        APPEND_OR_FAIL(append_str(&json, &size, &cap, buf));
-        APPEND_OR_FAIL(json_escape_append(&json, &size, &cap, title));
-        APPEND_OR_FAIL(append_str(&json, &size, &cap, "\", \"description\": \""));
-        APPEND_OR_FAIL(json_escape_append(&json, &size, &cap, desc));
-        APPEND_OR_FAIL(append_str(&json, &size, &cap, "\"}"));
-    }
-
-    APPEND_OR_FAIL(append_str(&json, &size, &cap, "\n  ]\n}"));
-    
-    sqlite3_finalize(stmt);
-    pthread_mutex_unlock(&db_stmt_mutex);
-    return json;
-
-oom_fail:
-    free(json);
-    sqlite3_finalize(stmt);
-    pthread_mutex_unlock(&db_stmt_mutex);
-    LOG_ERROR("DB", "OOM while generating JSON");
-    return NULL;
-}
-
 static const char *SQL_PROGRAM_UPSERT =
     "INSERT INTO programs (frequency, channel_service_id, start_time, end_time, title, description, event_id, source_id) "
     "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
@@ -475,16 +329,43 @@ static const char *SQL_PROGRAM_UPSERT =
     "description=CASE WHEN excluded.description <> '' THEN excluded.description ELSE programs.description END, "
     "event_id=excluded.event_id, source_id=excluded.source_id;";
 
+/* Retry transient locks while the caller still owns the scan data.
+ * sqlite3_busy_timeout handles ordinary contention; these bounded retries also
+ * cover SQLITE_LOCKED and lock races not handled by SQLite's busy handler. */
+static int transient_lock(int rc) {
+    return (rc & 0xff) == SQLITE_BUSY || (rc & 0xff) == SQLITE_LOCKED;
+}
+
+static int exec_retry(const char *sql, char **error) {
+    int rc;
+    for (int attempt = 0;; attempt++) {
+        rc = sqlite3_exec(db, sql, NULL, NULL, error);
+        if (!transient_lock(rc) || attempt == 2) return rc;
+        sqlite3_free(*error);
+        *error = NULL;
+        sqlite3_sleep(50 << attempt);
+    }
+}
+
+static int step_retry(sqlite3_stmt *stmt) {
+    int rc;
+    for (int attempt = 0;; attempt++) {
+        rc = sqlite3_step(stmt);
+        if (!transient_lock(rc) || attempt == 2) return rc;
+        sqlite3_reset(stmt);
+        sqlite3_sleep(50 << attempt);
+    }
+}
+
 // Bulk Upsert Implementation
 int db_bulk_upsert(ProgramList *list) {
     if (!db || !list || !list->programs || list->count == 0) return 0;
 
     pthread_mutex_lock(&db_stmt_mutex);
     char *transaction_error = NULL;
-    if (sqlite3_exec(db, "BEGIN IMMEDIATE;", NULL, NULL,
-                     &transaction_error) != SQLITE_OK) {
-        LOG_ERROR("DB", "Failed to begin EPG transaction: %s",
-                  transaction_error ? transaction_error : sqlite3_errmsg(db));
+    if (exec_retry("BEGIN IMMEDIATE;", &transaction_error) != SQLITE_OK) {
+        LOG_ERROR("DB", "Failed to begin EPG transaction (%d programs): %s",
+                  list->count, transaction_error ? transaction_error : sqlite3_errmsg(db));
         sqlite3_free(transaction_error);
         pthread_mutex_unlock(&db_stmt_mutex);
         return 0;
@@ -513,7 +394,7 @@ int db_bulk_upsert(ProgramList *list) {
         sqlite3_bind_int(stmt_upsert, 7, p->event_id);
         sqlite3_bind_int(stmt_upsert, 8, p->source_id);
 
-        if (sqlite3_step(stmt_upsert) != SQLITE_DONE) {
+        if (step_retry(stmt_upsert) != SQLITE_DONE) {
             LOG_ERROR("DB", "Upsert step failed: %s", sqlite3_errmsg(db));
             transaction_ok = 0;
         }
@@ -523,7 +404,7 @@ int db_bulk_upsert(ProgramList *list) {
     }
     
     const char *finish_sql = transaction_ok ? "COMMIT;" : "ROLLBACK;";
-    if (sqlite3_exec(db, finish_sql, NULL, NULL, &transaction_error) != SQLITE_OK) {
+    if (exec_retry(finish_sql, &transaction_error) != SQLITE_OK) {
         LOG_ERROR("DB", "Failed to finish EPG transaction: %s",
                   transaction_error ? transaction_error : sqlite3_errmsg(db));
         transaction_ok = 0;
@@ -538,6 +419,7 @@ int db_bulk_upsert(ProgramList *list) {
     pthread_mutex_unlock(&db_stmt_mutex);
 
     if (transaction_ok) db_invalidate_cache();
+    else LOG_ERROR("DB", "Failed to persist batch of %d programs after lock retries", list->count);
     return transaction_ok;
 }
 
@@ -580,20 +462,22 @@ void db_update_program_description(const char *frequency, const char *channel_se
     sqlite3_bind_text(stmt_update_desc, 3, channel_service_id, -1, SQLITE_STATIC);
     sqlite3_bind_int(stmt_update_desc, 4, event_id);
 
-    sqlite3_step(stmt_update_desc);
+    int rc = step_retry(stmt_update_desc);
+    if (rc != SQLITE_DONE) LOG_ERROR("DB", "Description update failed for %s/%s event %d: %s",
+        frequency, channel_service_id, event_id, sqlite3_errmsg(db));
     sqlite3_reset(stmt_update_desc);
     sqlite3_clear_bindings(stmt_update_desc);
 
     pthread_mutex_unlock(&db_stmt_mutex);
-    db_invalidate_cache();
+    if (rc == SQLITE_DONE) db_invalidate_cache();
 }
 
-// Delete program entries that ended more than 24 hours ago
+// Delete program entries that ended more than 48 hours ago
 int db_cleanup_expired() {
     if (!db) return 0;
     pthread_mutex_lock(&db_stmt_mutex);
 
-    // Calculate cutoff time: 48 hours ago in milliseconds (preserves history for series detection)
+    // Calculate cutoff time: 48 hours ago in milliseconds
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     long long now_ms = (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
@@ -609,8 +493,9 @@ int db_cleanup_expired() {
     }
 
     sqlite3_bind_int64(stmt, 1, cutoff_ms);
-    rc = sqlite3_step(stmt);
-    int deleted = sqlite3_changes(db);
+    rc = step_retry(stmt);
+    int deleted = rc == SQLITE_DONE ? sqlite3_changes(db) : 0;
+    if (rc != SQLITE_DONE) LOG_ERROR("DB", "Cleanup failed: %s", sqlite3_errmsg(db));
     sqlite3_finalize(stmt);
     pthread_mutex_unlock(&db_stmt_mutex);
 

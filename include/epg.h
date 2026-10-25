@@ -33,10 +33,4 @@ void start_epg_thread();
  */
 void stop_epg_thread();
 
-/**
- * Block until the first complete EPG scan cycle finishes
- * Used at startup to ensure guide data is available before serving
- */
-void wait_for_first_epg_scan();
-
 #endif

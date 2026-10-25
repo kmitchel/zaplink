@@ -15,7 +15,7 @@ SRCS = $(SRC_DIR)/main.c $(SRC_DIR)/channels.c $(SRC_DIR)/db.c $(SRC_DIR)/epg.c 
        $(SRC_DIR)/huffman.c $(SRC_DIR)/scanner.c $(SRC_DIR)/tuner.c \
        $(SRC_DIR)/stream_config.c $(SRC_DIR)/stream_session.c \
        $(SRC_DIR)/transcode.c $(SRC_DIR)/http_server.c $(SRC_DIR)/benchmark.c \
-       $(SRC_DIR)/thread_pool.c
+       $(SRC_DIR)/thread_pool.c $(SRC_DIR)/tune_config.c
 
 OBJS = $(patsubst $(SRC_DIR)/%.c, $(OBJ_DIR)/%.o, $(SRCS))
 
@@ -23,7 +23,8 @@ TARGET = $(BUILD_DIR)/zaplink
 TEST_TARGET = $(BUILD_DIR)/test_channels
 TEST_TARGETS = $(TEST_TARGET) $(BUILD_DIR)/test_tuner $(BUILD_DIR)/test_db_concurrency \
                $(BUILD_DIR)/test_stream_config $(BUILD_DIR)/test_stream_session \
-               $(BUILD_DIR)/test_transcode $(BUILD_DIR)/test_huffman $(BUILD_DIR)/test_db_busy $(BUILD_DIR)/test_scanner
+               $(BUILD_DIR)/test_transcode $(BUILD_DIR)/test_huffman $(BUILD_DIR)/test_db_busy $(BUILD_DIR)/test_scanner \
+               $(BUILD_DIR)/test_tune_config $(BUILD_DIR)/test_epg $(BUILD_DIR)/test_xmltv $(BUILD_DIR)/test_session_init
 
 all: $(TARGET) huffman.bin
 
@@ -48,8 +49,17 @@ clean:
 $(TEST_TARGET): tests/test_channels.c $(OBJ_DIR)/channels.o
 	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
-$(BUILD_DIR)/test_scanner: tests/test_scanner.c src/scanner.c
-	$(CC) $(CPPFLAGS) $(CFLAGS) $< -o $@ $(LDFLAGS)
+$(BUILD_DIR)/test_scanner: tests/test_scanner.c src/scanner.c $(OBJ_DIR)/tune_config.o
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(OBJ_DIR)/tune_config.o -o $@ $(LDFLAGS)
+
+$(BUILD_DIR)/test_tune_config: tests/test_tune_config.c $(OBJ_DIR)/tune_config.o
+	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@ $(LDFLAGS)
+
+$(BUILD_DIR)/test_epg: tests/test_epg.c src/epg.c $(OBJ_DIR)/channels.o $(OBJ_DIR)/tuner.o $(OBJ_DIR)/db.o $(OBJ_DIR)/huffman.o $(OBJ_DIR)/tune_config.o
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(filter %.o,$^) -o $@ $(LDFLAGS) -Wl,--wrap=tuner_set_process
+
+$(BUILD_DIR)/test_xmltv: tests/test_xmltv.c $(OBJ_DIR)/db.o $(OBJ_DIR)/channels.o
+	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
 $(BUILD_DIR)/test_tuner: tests/test_tuner.c $(OBJ_DIR)/tuner.o
 	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@ $(LDFLAGS)
@@ -66,7 +76,10 @@ $(BUILD_DIR)/test_stream_config: tests/test_stream_config.c $(OBJ_DIR)/stream_co
 $(BUILD_DIR)/test_stream_session: tests/test_stream_session.c $(OBJ_DIR)/stream_session.o $(OBJ_DIR)/stream_config.o
 	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
-$(BUILD_DIR)/test_transcode: tests/test_transcode.c $(OBJ_DIR)/transcode.o $(OBJ_DIR)/stream_config.o $(OBJ_DIR)/tuner.o $(OBJ_DIR)/channels.o $(OBJ_DIR)/stream_session.o
+$(BUILD_DIR)/test_session_init: tests/test_session_init.c $(OBJ_DIR)/stream_session.o $(OBJ_DIR)/stream_config.o
+	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@ $(LDFLAGS) -Wl,--wrap=pthread_condattr_init,--wrap=pthread_condattr_setclock,--wrap=pthread_condattr_destroy,--wrap=pthread_cond_init,--wrap=pthread_cond_destroy
+
+$(BUILD_DIR)/test_transcode: tests/test_transcode.c $(OBJ_DIR)/transcode.o $(OBJ_DIR)/stream_config.o $(OBJ_DIR)/tuner.o $(OBJ_DIR)/channels.o $(OBJ_DIR)/stream_session.o $(OBJ_DIR)/tune_config.o
 	$(CC) $(CPPFLAGS) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
 $(BUILD_DIR)/test_huffman: tests/test_huffman.c $(OBJ_DIR)/huffman.o huffman.bin
@@ -79,30 +92,34 @@ check-huffman: huffman.bin $(BUILD_DIR)/check_huffman_asset
 	python3 support/gen_huffman.py --check
 	$(BUILD_DIR)/check_huffman_asset
 
-test: $(TARGET) huffman.bin $(TEST_TARGETS)
+test: $(TARGET) $(BUILD_DIR)/zaplink_no_tuner_test huffman.bin $(TEST_TARGETS)
 	$(BUILD_DIR)/test_channels
 	$(BUILD_DIR)/test_scanner
+	$(BUILD_DIR)/test_tune_config
+	$(BUILD_DIR)/test_epg
+	$(BUILD_DIR)/test_xmltv
 	$(BUILD_DIR)/test_tuner
 	$(BUILD_DIR)/test_db_concurrency
 	$(BUILD_DIR)/test_db_busy
 	$(BUILD_DIR)/test_stream_config
 	$(BUILD_DIR)/test_stream_session
+	$(BUILD_DIR)/test_session_init
 	$(BUILD_DIR)/test_transcode
 	$(BUILD_DIR)/test_huffman
 	tests/test_http_contract.sh
 	$(MAKE) http-descriptor-test
 
-$(BUILD_DIR)/zaplink_no_tuner_test: $(SRCS)
+$(BUILD_DIR)/zaplink_no_tuner_test: $(SRCS) tests/tuner_fixture.c $(wildcard include/*.h)
 	@mkdir -p $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -DTUNER_WAIT_TIMEOUT_SECONDS=0 $^ -o $@ $(LDFLAGS)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -DTUNER_WAIT_TIMEOUT_SECONDS=0 $(SRCS) tests/tuner_fixture.c -o $@ $(LDFLAGS) -Wl,--wrap=discover_tuners,--wrap=wait_for_tuners
 
 http-descriptor-test: $(BUILD_DIR)/zaplink_no_tuner_test
 	python3 tests/test_http_descriptors.py
 
-http-contract-test: $(TARGET)
+http-contract-test: $(BUILD_DIR)/zaplink_no_tuner_test
 	tests/test_http_contract.sh
 
-install: $(TARGET) check-huffman
+install: $(TARGET) check-huffman LICENSE THIRD_PARTY_NOTICES.md
 	@echo "Installing ZapLink..."
 	@if ! id -u zaplink > /dev/null 2>&1; then \
 		useradd -r -s /usr/sbin/nologin zaplink; \
@@ -113,6 +130,7 @@ install: $(TARGET) check-huffman
 	@if getent group render >/dev/null; then usermod -aG render zaplink; fi
 	install -o root -g root -m 755 $(TARGET) $(INSTALL_DIR)/zaplink
 	install -o root -g root -m 644 huffman.bin $(INSTALL_DIR)/huffman.bin
+	install -o root -g root -m 644 LICENSE THIRD_PARTY_NOTICES.md $(INSTALL_DIR)/
 	install -Dm644 support/zaplink.service $(SERVICE_DIR)/zaplink.service
 	systemctl enable zaplink.service
 	systemctl daemon-reload

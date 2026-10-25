@@ -1,6 +1,7 @@
 [Unit]
 Description=ZapLink DTV Engine
 After=network.target
+ConditionPathExists=/var/lib/zaplink/channels.conf
 
 [Service]
 Type=simple

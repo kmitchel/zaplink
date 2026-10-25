@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include <time.h>
 
 #include "stream_config.h"
 #include "stream_session.h"
@@ -96,6 +97,13 @@ int main(void) {
     assert(start_count == 1);
 
     unsigned char packet[188];
+    struct timespec before, after;
+    assert(!clock_gettime(CLOCK_MONOTONIC, &before));
+    assert(stream_session_read(first, &first_cursor, packet, sizeof(packet), 400) == 0);
+    assert(!clock_gettime(CLOCK_MONOTONIC, &after));
+    long elapsed = (after.tv_sec - before.tv_sec) * 1000L +
+                   (after.tv_nsec - before.tv_nsec) / 1000000L;
+    assert(elapsed >= 350 && elapsed < 2000);
     memset(packet, 0x47, sizeof(packet));
     assert(write(writer_fds[0], packet, sizeof(packet)) == (ssize_t)sizeof(packet));
     unsigned char first_copy[188];
